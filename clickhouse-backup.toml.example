@@ -1,0 +1,102 @@
+# Example configuration of clickhouse-backup.
+#
+# Copy this file to /opt/clickhouse-backup/clickhouse-backup.toml and uncomment what you need.
+# Every key is optional, the values below are the built-in defaults.
+# Unknown keys are rejected.
+
+# Root directory of backups. Each run creates the subdirectory
+# <backup_root>/YYYY-MM-DD-HHMMSS-clickhouse-backup (the timestamp is in UTC).
+# This directory and <temporary_directory>/clickhouse-backup are added to 'backups.allowed_path'
+# of the ClickHouse server automatically.
+#backup_root = "/srv/clickhouse-backup"
+
+# Directory for temporary files. The ClickHouse server writes the uncompressed tar archive of each
+# database to the private subdirectory <temporary_directory>/clickhouse-backup/<random name>,
+# then the archive is compressed into backup_root and the temporary file is removed.
+# This is a path inside the file system of the server process: it works with PrivateTmp=no
+# and with PrivateTmp=yes of clickhouse-server.service, nothing has to be changed here.
+# Free space equal to the uncompressed size of the largest database is required
+# (of the 'jobs' largest databases, if jobs > 1).
+#temporary_directory = "/var/tmp"
+
+# Complete backups older than this number of days are removed after each successful run.
+#backup_save_days = 7
+
+# zstd compression level, from 1 to 19. 3 is the default level of zstd itself.
+# The command line option --compression-level overrides this value and the values
+# of all [databases.<name>] sections.
+# Recommendation: keep 3. Data of MergeTree tables is already compressed by ClickHouse,
+# high levels cost a lot of CPU time and memory and save little space.
+#compression_level = 3
+
+# Enable the long distance matching mode of zstd (zstd --long): better ratio, more memory.
+#compression_long = false
+
+# Number of zstd threads: an integer number, 0 (all CPU cores) or "auto" (half of CPU cores).
+#
+# Recommendation: keep 4, also on a server with many cores.
+# - Speed: with 4 threads level 3 compresses about 800 MiB/s, more threads only help
+#   if the disks are faster than that.
+# - CPU: zstd threads take CPU cores away from the queries of the ClickHouse server.
+# - Memory: grows with the number of threads and with the level. Measured with zstd 1.5.5:
+#     level  3:  ~50 MiB for 1 thread,   ~90 MiB for 4 threads,  ~150 MiB for 8 threads
+#     level  9:                         ~200 MiB for 4 threads,  ~340 MiB for 8 threads
+#     level 19: ~190 MiB for 1 thread,  ~590 MiB for 4 threads, ~1100 MiB for 8 threads
+#   so "auto" on a server with 96 cores means 48 threads: about 1 GiB of memory at level 3,
+#   but about 6-7 GiB at level 19 (extrapolated). If jobs > 1, multiply by the number of jobs.
+#compression_threads = 4
+
+# Number of databases processed in parallel: an integer number or "auto" (half of CPU cores).
+# One BACKUP statement is already executed by many threads of the server.
+#jobs = 1
+
+# A warning is logged if the backup of one database takes more than this number of hours.
+#warning_threshold_hours = 4
+
+# Databases which are not saved to the backup.
+# The databases system, INFORMATION_SCHEMA and information_schema are always skipped.
+#exclude_databases = ["scratch", "tmp"]
+
+# Tables which are not saved to the backup: neither data nor definition.
+# One line per database: exclude_tables.<database> = [<tables>]
+#exclude_tables.default = ["debug_log", "import_buffer"]
+#exclude_tables."database-with-unusual-name" = ["some table"]
+
+# Settings of one database, they override the global values above.
+# Only these three keys are allowed: compression_level, compression_long, warning_threshold_hours.
+# One line per setting: databases.<database>.<key> = <value>
+#databases.mydatabase.compression_level = 9
+#databases.mydatabase.compression_long = true
+#databases.mydatabase.warning_threshold_hours = 12
+#databases."database-with-unusual-name".compression_level = 1
+#
+# The same can be written as a section, but TOML attaches every key written below a section
+# header to this section, so such sections must be the last lines of this file:
+#
+#[databases.mydatabase]
+#compression_level = 9
+#warning_threshold_hours = 12
+
+# Directories saved to the "config-only" archive.
+#config_directories = ["/etc/clickhouse-server", "/etc/clickhouse-client"]
+
+# Configuration file for clickhouse-client (the --config-file option), put the user name and
+# the password here if the 'default' user without password is not allowed to connect.
+#clickhouse_client_config = ""
+
+# Server configuration file managed by clickhouse-backup, it contains 'backups.allowed_path'.
+#server_config_file = "/etc/clickhouse-server/config.d/clickhouse-backup.xml"
+
+# How long to wait until the server applies the changed configuration.
+#server_config_reload_timeout_seconds = 30
+
+# Owner and mode of the backup directories. The ClickHouse server itself writes the archives,
+# so the owner must be the user of the clickhouse-server process.
+#user = "clickhouse"
+#group = "clickhouse"
+#mode = 0o700
+
+# External programs.
+#clickhouse_client = "/usr/bin/clickhouse-client"
+#zstd = "/usr/bin/zstd"
+#tar = "/usr/bin/tar"

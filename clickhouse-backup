@@ -1,0 +1,952 @@
+#!/usr/bin/python3 -u
+
+__license__ = "GNU General Public License, version 3.0 or later"
+__contact__ = "https://github.com/makhomed/clickhouse-backup"
+__version__ = "1.2.0"
+
+try:
+    import tomllib  # https://docs.python.org/3/library/tomllib.html
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # https://pypi.org/project/tomli/
+    except ModuleNotFoundError:
+        raise SystemExit(
+            "\nTOML [ https://toml.io/ ] parser not found.\n"
+            "\nInstall it with:\n"
+            "\n    python3 -m pip install tomli\n"
+        )
+
+from pathlib import Path
+
+import argparse
+import concurrent.futures
+import datetime
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import types
+import urllib.parse
+import uuid
+import xml.etree.ElementTree
+import xml.sax.saxutils
+
+import logging
+import systemd.journal
+
+PROGRAM = "clickhouse-backup"
+
+configuration_filename = Path("/opt/clickhouse-backup/clickhouse-backup.toml")
+# settings which can be overridden for one database in the section [databases.<name>]
+configuration_overridable = ("compression_level", "compression_long", "warning_threshold_hours")
+
+configuration_defaults = dict(
+    backup_root = "/srv/clickhouse-backup",
+    backup_save_days = 7,
+    temporary_directory = "/var/tmp",
+    clickhouse_client = "/usr/bin/clickhouse-client",
+    clickhouse_client_config = "",
+    zstd = "/usr/bin/zstd",
+    tar = "/usr/bin/tar",
+    user = "clickhouse",
+    group = "clickhouse",
+    mode = 0o700,
+    jobs = 1,
+    compression_level = 3,  # the default compression level of zstd itself
+    compression_long = False,
+    compression_threads = 4,
+    warning_threshold_hours = 4,
+    exclude_databases = [],
+    exclude_tables = {},
+    databases = {},
+    config_directories = ["/etc/clickhouse-server", "/etc/clickhouse-client"],
+    server_config_file = "/etc/clickhouse-server/config.d/clickhouse-backup.xml",
+    server_config_reload_timeout_seconds = 30,
+)
+
+# These databases hold no user data: 'system' contains only virtual tables and server logs,
+# access entities and user defined functions from it are saved into the "globals" archive.
+SYSTEM_DATABASES = ("system", "INFORMATION_SCHEMA", "information_schema")
+
+# System tables with objects which do not belong to any database (the "globals" archive).
+GLOBAL_SYSTEM_TABLES = (
+    "users", "roles", "settings_profiles", "row_policies", "quotas",
+    "functions", "named_collections", "resources", "workloads",
+)
+
+# Table engines whose data is written by the BACKUP statement (checked against ClickHouse 26.10
+# sources and by experiment). Any engine with the "MergeTree" suffix is supported as well.
+ENGINES_WITH_DATA_BACKUP = frozenset((
+    "Log", "TinyLog", "StripeLog", "MaterializedView", "KeeperMap", "EmbeddedRocksDB", "TimeSeries",
+))
+
+# ClickHouse 26.10 is unable to restore data of these engines from a tar archive: RESTORE fails with
+# "getPosition not supported when reading from archive" and leaves the database partially restored.
+# Their data is excluded from the backup (EXCEPT DATA FROM TABLES), so RESTORE of the whole database
+# always works. Data of the Memory engine is volatile anyway: it is lost on every restart of the server.
+ENGINES_WITH_DATA_EXCLUDED = frozenset(("Memory",))
+
+# Table engines which keep data locally, but BACKUP saves only their definitions.
+ENGINES_WITH_LOCAL_DATA_WITHOUT_BACKUP = frozenset(("File", "Set", "Join"))
+
+BACKUP_DIRECTORY_SUFFIX = f"-{PROGRAM}"
+BACKUP_DIRECTORY_REGEX = re.compile(r"(\d{4}-\d{2}-\d{2}-\d{6})" + re.escape(BACKUP_DIRECTORY_SUFFIX) + r"(\.failed|\.partial)?")
+TIMESTAMP_FORMAT = "%Y-%m-%d-%H%M%S"
+
+cfg = None  # types.SimpleNamespace with the validated configuration, see read_configuration()
+
+# types.SimpleNamespace(data_path, pid, root), see detect_server(): "root" is the prefix through which
+# this process sees the files exactly as the server process sees them, it is empty if both processes
+# share one mount namespace, and it is /proc/<pid>/root if the server has its own one (PrivateTmp=yes)
+server = None
+
+logger = logging.getLogger(PROGRAM)
+
+stop_event = threading.Event()  # set when the script is asked to terminate by a signal
+
+child_environment = None
+
+
+class BackupInterrupted(Exception):
+    pass
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Save backups of all ClickHouse databases, one archive per database.",
+    )
+    parser.add_argument("--version", action="version", version=f"{PROGRAM} {__version__}")
+    parser.add_argument(
+        "--config", type=Path, default=configuration_filename, metavar="FILE",
+        help=f"configuration file in TOML format (default: {configuration_filename})",
+    )
+    parser.add_argument(
+        "--compression-level", type=int, default=None, choices=range(1, 20), metavar="LEVEL",
+        help="zstd compression level, from 1 to 19, overrides every 'compression_level' key of the"
+             f" configuration file (default: {configuration_defaults['compression_level']})",
+    )
+    return parser.parse_args()
+
+
+def require_type(key, value, expected_type):
+    # bool is a subclass of int in Python, but "jobs = true" is always a mistake
+    expected_types = expected_type if isinstance(expected_type, tuple) else (expected_type,)
+    expected = " or ".join(one_type.__name__ for one_type in expected_types)
+    if (isinstance(value, bool) and bool not in expected_types) or not isinstance(value, expected_types):
+        raise ValueError(f"configuration key {key!r}: expected {expected}, got {type(value).__name__}")
+
+
+def auto_or_integer(key, value, minimum):
+    cpu_count = len(os.sched_getaffinity(0)) or os.cpu_count() or 1
+    if value == "auto":
+        return max(cpu_count // 2, 1)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"configuration key {key!r}: expected integer number or 'auto' string, got {value!r}")
+    if value < minimum:
+        raise ValueError(f"configuration key {key!r}: expected value >= {minimum}, got {value}")
+    return value
+
+
+def validate_overridable(name, key, value):
+    """ name is the full name of the key in the configuration file, for example databases.mydb.compression_level """
+    if key == "compression_level":
+        require_type(name, value, int)
+        if not (1 <= value <= 19):
+            raise ValueError(
+                f"configuration key {name!r}: zstd compression level must be"
+                f" ( 1 <= level ) and ( level <= 19 ), unexpected value {value}"
+            )
+    elif key == "compression_long":
+        require_type(name, value, bool)
+    elif key == "warning_threshold_hours":
+        require_type(name, value, (int, float))
+        if value <= 0:
+            raise ValueError(f"configuration key {name!r}: expected value > 0, got {value}")
+    else:
+        raise ValueError(f"configuration key {name!r}: this key can not be set for one database")
+
+
+def read_configuration(arguments):
+    filename = arguments.config
+    if filename.is_file():
+        values = tomllib.loads(filename.read_text())
+    elif filename == configuration_filename:
+        values = dict()  # the default configuration file is optional
+    else:
+        raise ValueError(f"configuration file {filename} not found")
+    for key in values:
+        if key not in configuration_defaults:
+            raise ValueError(f"unexpected configuration key {key!r} in {filename}")
+    for key, default in configuration_defaults.items():
+        values.setdefault(key, default)
+    # the command line overrides the configuration file, the sections [databases.<name>] too
+    values["command_line_compression_level"] = arguments.compression_level
+
+    for key in ("backup_root", "temporary_directory", "clickhouse_client", "clickhouse_client_config", "zstd", "tar",
+                "user", "group", "server_config_file"):
+        require_type(key, values[key], str)
+    for key in ("backup_save_days", "mode", "server_config_reload_timeout_seconds"):
+        require_type(key, values[key], int)
+    for key in configuration_overridable:
+        validate_overridable(key, key, values[key])
+    require_type("databases", values["databases"], dict)
+    for database, overrides in values["databases"].items():
+        require_type(f"databases.{database}", overrides, dict)
+        for key, value in overrides.items():
+            validate_overridable(f"databases.{database}.{key}", key, value)
+    require_type("exclude_databases", values["exclude_databases"], list)
+    require_type("exclude_tables", values["exclude_tables"], dict)
+    require_type("config_directories", values["config_directories"], list)
+
+    values["backup_root"] = Path(values["backup_root"])
+    if not values["backup_root"].is_absolute() or values["backup_root"] == Path("/"):
+        raise ValueError(f"configuration key 'backup_root': expected absolute path, got {values['backup_root']}")
+    values["temporary_directory"] = Path(values["temporary_directory"])
+    if not values["temporary_directory"].is_absolute():
+        raise ValueError(
+            f"configuration key 'temporary_directory': expected absolute path, got {values['temporary_directory']}"
+        )
+    values["server_config_file"] = Path(values["server_config_file"])
+    if not values["server_config_file"].is_absolute():
+        raise ValueError("configuration key 'server_config_file': expected absolute path")
+    if values["backup_save_days"] < 1:
+        raise ValueError(f"configuration key 'backup_save_days': expected value >= 1, got {values['backup_save_days']}")
+    if not (0o000 <= values["mode"] <= 0o777):
+        raise ValueError(f"configuration key 'mode': expected 0o000 <= mode <= 0o777, got 0o{values['mode']:o}")
+    values["jobs"] = auto_or_integer("jobs", values["jobs"], minimum=1)
+    # 0 means "let zstd detect the number of CPU cores"
+    values["compression_threads"] = auto_or_integer("compression_threads", values["compression_threads"], minimum=0)
+
+    for database in values["exclude_databases"]:
+        require_type("exclude_databases", database, str)
+    for database, tables in values["exclude_tables"].items():
+        require_type(f"exclude_tables.{database}", tables, list)
+        for table in tables:
+            require_type(f"exclude_tables.{database}", table, str)
+    config_directories = []
+    for directory in values["config_directories"]:
+        require_type("config_directories", directory, str)
+        directory = Path(directory)
+        if not directory.is_absolute():
+            raise ValueError(f"configuration key 'config_directories': expected absolute path, got {directory}")
+        config_directories.append(directory)
+    values["config_directories"] = config_directories
+
+    for key in ("clickhouse_client", "zstd", "tar"):
+        if not Path(values[key]).is_file():
+            raise ValueError(f"required binary file {values[key]} not found")
+    if values["clickhouse_client_config"] and not Path(values["clickhouse_client_config"]).is_file():
+        raise ValueError(f"clickhouse-client configuration file {values['clickhouse_client_config']} not found")
+
+    values["uid"] = pwd.getpwnam(values["user"]).pw_uid
+    values["gid"] = grp.getgrnam(values["group"]).gr_gid
+
+    global cfg
+    cfg = types.SimpleNamespace(**values)
+
+
+def handle_exit_signal(signum, frame):
+    if stop_event.is_set():
+        return  # termination is already in progress
+    stop_event.set()
+    sys.exit(128 + signum)
+
+
+def register_exit_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
+        signal.signal(sig, handle_exit_signal)
+
+
+def configure_logging():
+    root_logger = logging.getLogger("")
+    root_logger.setLevel(logging.INFO)
+
+    console_log_formatter = logging.Formatter('%(message)s')
+    console_log_handler = logging.StreamHandler()
+    console_log_handler.setFormatter(console_log_formatter)
+    console_log_handler.setLevel(logging.WARNING)
+    root_logger.addHandler(console_log_handler)
+
+    journal_log_formatter = logging.Formatter('%(message)s')
+    journal_log_handler = systemd.journal.JournalHandler(SYSLOG_IDENTIFIER=PROGRAM)
+    journal_log_handler.setFormatter(journal_log_formatter)
+    journal_log_handler.setLevel(logging.INFO)
+    root_logger.addHandler(journal_log_handler)
+
+
+def init(arguments):
+    if os.getegid() != 0 or os.geteuid() != 0:
+        raise ValueError("root privileges required")
+    register_exit_signal_handlers()
+    read_configuration(arguments)
+    global child_environment
+    child_environment = dict(os.environ)
+    child_environment["LC_ALL"] = "C"
+
+
+class Timer:
+    def __init__(self):
+        self._start_ns = None
+        self._accum_ns = 0
+
+    def start(self):
+        if self._start_ns is None:
+            self._start_ns = time.perf_counter_ns()
+        return self
+
+    def stop(self):
+        if self._start_ns is not None:
+            self._accum_ns += time.perf_counter_ns() - self._start_ns
+            self._start_ns = None
+        return self
+
+    def seconds(self):
+        ns = self._accum_ns + (time.perf_counter_ns() - self._start_ns if self._start_ns is not None else 0)
+        return ns // 1_000_000_000
+
+    def hours(self):
+        return self.seconds() / 3600
+
+    def hms(self):
+        t = self.seconds()
+        h = t // 3600
+        m = (t % 3600) // 60
+        s = t % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def setting(key, database=None):
+    """ Value of an overridable setting: the command line, then [databases.<name>], then the global value. """
+    if key == "compression_level" and cfg.command_line_compression_level is not None:
+        return cfg.command_line_compression_level
+    return cfg.databases.get(database, dict()).get(key, getattr(cfg, key))
+
+
+def describe_compression(database=None):
+    text = f"compression_level={setting('compression_level', database)}"
+    if setting("compression_long", database):
+        text += " compression_long=true"
+    return text
+
+
+def host_path(path):
+    """ The path by which this process reaches a file which the server knows as 'path', see detect_server(). """
+    return Path(f"{server.root}{path}")
+
+
+def format_size(size):
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def run_command(command, capture_stdout=False, interruptible=True):
+    """
+        Run an external command without a shell and return its stdout.
+        Raise RuntimeError if the command fails.
+        Terminate the command and raise BackupInterrupted if the script is asked to stop.
+    """
+    process = subprocess.Popen(
+        [str(argument) for argument in command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=child_environment,
+        cwd="/",
+    )
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+            break
+        except subprocess.TimeoutExpired:
+            if interruptible and stop_event.is_set():
+                process.terminate()
+                process.communicate()
+                raise BackupInterrupted(f"command {command[0]} was terminated")
+    if process.returncode != 0:
+        raise RuntimeError(f"command {command[0]} failed with exit code {process.returncode}: {stderr.strip()}")
+    return stdout
+
+
+def sql_identifier(name):
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def sql_string(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def clickhouse_query(sql, query_id=None, interruptible=True):
+    """ Execute one statement and return the list of result rows, each row is a dict. """
+    command = [cfg.clickhouse_client]
+    if cfg.clickhouse_client_config:
+        command += ["--config-file", cfg.clickhouse_client_config]
+    command += ["--format", "JSONEachRow", "--query_id", query_id or str(uuid.uuid4()), "--query", sql]
+    stdout = run_command(command, capture_stdout=True, interruptible=interruptible)
+    return [json.loads(line) for line in stdout.splitlines() if line.strip()]
+
+
+def kill_backup_query(query_id):
+    """ A BACKUP statement keeps running on the server even if its client is gone, so it must be killed explicitly. """
+    try:
+        clickhouse_query(f"KILL QUERY WHERE query_id = {sql_string(query_id)} SYNC", interruptible=False)
+    except Exception as exc:
+        logger.warning(f"unable to kill BACKUP query {query_id}: {exc}")
+
+
+def clickhouse_backup(elements_sql, tar_path, structure_only=False):
+    """
+        Run "BACKUP <elements> TO File('<tar_path>')" and wait until it is finished.
+
+        The statement is started with the ASYNC keyword and then polled through system.backups,
+        because a synchronous BACKUP sends nothing to the client until it is finished,
+        so the client fails with a receive timeout on any long backup.
+    """
+    backup_id = str(uuid.uuid4())
+    settings = f"id = {sql_string(backup_id)}"
+    if structure_only:
+        settings += ", structure_only = true"
+    statement = f"BACKUP {elements_sql} TO File({sql_string(str(tar_path))}) SETTINGS {settings} ASYNC"
+    try:
+        clickhouse_query(statement, query_id=backup_id)
+        delay = 0.1
+        while True:
+            rows = clickhouse_query(
+                "SELECT status, error, compressed_size FROM system.backups"
+                f" WHERE id = {sql_string(backup_id)}"
+            )
+            if len(rows) != 1:
+                raise RuntimeError(f"backup {backup_id} not found in system.backups, was the server restarted?")
+            status = rows[0]["status"]
+            if status == "BACKUP_CREATED":
+                break
+            if status != "CREATING_BACKUP":
+                error = rows[0]["error"].splitlines()[0] if rows[0]["error"] else "no error message"
+                raise RuntimeError(f"backup status is {status}: {error}")
+            if stop_event.wait(delay):
+                raise BackupInterrupted(f"backup {backup_id} was interrupted")
+            delay = min(delay * 2, 5.0)
+    except BaseException:
+        kill_backup_query(backup_id)
+        raise
+    expected_size = int(rows[0]["compressed_size"])
+    if not host_path(tar_path).is_file():
+        raise RuntimeError(f"server reported a successful backup, but {host_path(tar_path)} does not exist")
+    actual_size = host_path(tar_path).stat().st_size
+    if actual_size != expected_size:
+        raise RuntimeError(f"unexpected size of {tar_path}: {actual_size} bytes, server reported {expected_size} bytes")
+
+
+def compress_and_verify(tar_path, backup_directory, database=None, must_contain=None):
+    """
+        Compress <temporary directory>/<name>.tar into <backup directory>/<name>.tar.zst,
+        remove <name>.tar, verify the result and return its path.
+        tar_path is a path of this process, see host_path().
+    """
+    zst_path = backup_directory / (tar_path.name + ".zst")
+    command = [
+        cfg.zstd, "--quiet", f"-{setting('compression_level', database)}", f"--threads={cfg.compression_threads}",
+    ]
+    if setting("compression_long", database):
+        command.append("--long")
+    # --rm removes the source file only after successful compression
+    command += ["--rm", "-o", zst_path, "--", tar_path]
+    run_command(command)
+    os.chown(zst_path, cfg.uid, cfg.gid)
+    os.chmod(zst_path, 0o640)
+    # 1) the zstd frames and their content checksums are intact
+    run_command([cfg.zstd, "--test", "--quiet", "--", zst_path])
+    # 2) the tar structure is readable up to the end, and the mandatory member is present
+    command = [cfg.tar, f"--use-compress-program={cfg.zstd}", "--list", "--file", zst_path]
+    if must_contain is not None:
+        command.append(must_contain)
+    run_command(command)
+    return zst_path
+
+
+def filename_timestamp():
+    return utc_now().strftime(TIMESTAMP_FORMAT)
+
+
+def safe_filename_component(name):
+    # identity for ordinary names, percent-encoding for anything else ('/', spaces, etc.)
+    return urllib.parse.quote(name, safe="")
+
+
+def backup_clickhouse_objects(directories, stem, elements_sql, database=None, structure_only=False):
+    tar_path = directories.temporary / f"{stem}.tar"  # the path as the server sees it
+    clickhouse_backup(elements_sql, tar_path, structure_only=structure_only)
+    # ".backup" is the manifest of a ClickHouse backup, RESTORE is impossible without it
+    return compress_and_verify(host_path(tar_path), directories.backup, database=database, must_contain=".backup")
+
+
+def backup_element_for_database(database, excluded_tables, data_excluded_tables):
+    element = f"DATABASE {sql_identifier(database)}"
+    if excluded_tables:
+        element += " EXCEPT TABLES " + ", ".join(sql_identifier(table) for table in excluded_tables)
+    if data_excluded_tables:
+        element += " EXCEPT DATA FROM TABLES " + ", ".join(sql_identifier(table) for table in data_excluded_tables)
+    return element
+
+
+def backup_globals(directories):
+    rows = clickhouse_query("SELECT name FROM system.tables WHERE database = 'system'")
+    existing = set(row["name"] for row in rows)
+    tables = [table for table in GLOBAL_SYSTEM_TABLES if table in existing]
+    elements_sql = ", ".join(f"TABLE system.{sql_identifier(table)}" for table in tables)
+    return backup_clickhouse_objects(directories, f"{filename_timestamp()}--globals-only", elements_sql)
+
+
+def backup_schema(directories, excluded_tables):
+    # "DATABASE a EXCEPT TABLES t, DATABASE b" is a syntax error: the list after EXCEPT TABLES
+    # consumes every following comma, so several databases with excluded tables can be put
+    # into one statement only in the form "ALL EXCEPT DATABASES ... EXCEPT TABLES ..."
+    excluded_databases = list(SYSTEM_DATABASES) + sorted(cfg.exclude_databases)
+    elements_sql = "ALL EXCEPT DATABASES " + ", ".join(sql_identifier(database) for database in excluded_databases)
+    qualified = [
+        f"{sql_identifier(database)}.{sql_identifier(table)}"
+        for database in sorted(excluded_tables) for table in excluded_tables[database]
+    ]
+    if qualified:
+        elements_sql += " EXCEPT TABLES " + ", ".join(qualified)
+    return backup_clickhouse_objects(
+        directories, f"{filename_timestamp()}--schema-only", elements_sql, structure_only=True
+    )
+
+
+def backup_config(directories):
+    tar_path = host_path(directories.temporary / f"{filename_timestamp()}--config-only.tar")
+    with tarfile.open(tar_path, "w") as archive:
+        for directory in cfg.config_directories:
+            if directory.is_dir():
+                archive.add(directory, arcname=str(directory.relative_to("/")))
+            else:
+                logger.warning(f"configuration directory {directory} not found, it is not saved to the backup")
+    return compress_and_verify(tar_path, directories.backup)
+
+
+def backup_database(directories, database, excluded_tables, data_excluded_tables):
+    stem = f"{filename_timestamp()}-{safe_filename_component(database)}"
+    elements_sql = backup_element_for_database(database, excluded_tables, data_excluded_tables)
+    return backup_clickhouse_objects(directories, stem, elements_sql, database=database)
+
+
+def run_task(label, function, *args):
+    """ Returns (label, timer, archive path or None, exception or None), never raises. """
+    timer = Timer().start()
+    try:
+        if stop_event.is_set():
+            raise BackupInterrupted("backup was interrupted")
+        path = function(*args)
+        return label, timer.stop(), path, None
+    except Exception as exc:
+        return label, timer.stop(), None, exc
+
+
+def acquire_lock():
+    lock_file = open(f"/run/{PROGRAM}.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise RuntimeError(f"another instance of {PROGRAM} is already running")
+    return lock_file  # the lock is held while this object is alive
+
+
+def prepare_backup_root():
+    cfg.backup_root.mkdir(mode=cfg.mode, parents=True, exist_ok=True)
+    os.chown(cfg.backup_root, cfg.uid, cfg.gid)
+    os.chmod(cfg.backup_root, cfg.mode)
+
+
+def detect_server():
+    """
+        Find the process of the server and the way to reach its files.
+
+        If clickhouse-server is started by systemd with PrivateTmp=yes (or with any other option which
+        creates a mount namespace), then /tmp and /var/tmp of the server are not /tmp and /var/tmp of
+        this process. The kernel shows the file system of any process, exactly as this process sees it,
+        in /proc/<pid>/root, and root is allowed to work there. So the temporary files are always
+        reachable, whatever the sandboxing options of the service are, and no option needs to be parsed.
+    """
+    rows = clickhouse_query("SELECT path FROM system.disks WHERE name = 'default'")
+    if len(rows) != 1:
+        raise RuntimeError("unable to detect the data path of the ClickHouse server")
+    data_path = Path(rows[0]["path"])
+    status_file = data_path / "status"  # written by the server at startup: "PID: <pid>"
+    if not status_file.is_file():
+        raise RuntimeError(f"status file {status_file} of the ClickHouse server not found, is the server on this host?")
+    match = re.search(r"^PID: (\d+)$", status_file.read_text(), re.MULTILINE)
+    if not match:
+        raise RuntimeError(f"unable to find the PID of the ClickHouse server in {status_file}")
+    pid = int(match.group(1))
+    try:
+        executable = os.readlink(f"/proc/{pid}/exe")
+        server_namespace = os.readlink(f"/proc/{pid}/ns/mnt")
+    except OSError as exc:
+        raise RuntimeError(f"process {pid} from {status_file} is not accessible: {exc}")
+    if "clickhouse" not in Path(executable).name:
+        raise RuntimeError(f"process {pid} from {status_file} is {executable}, it is not a ClickHouse server")
+    if server_namespace == os.readlink("/proc/self/ns/mnt"):
+        root = ""
+    else:
+        root = f"/proc/{pid}/root"
+        logger.info(f"clickhouse-server has its own mount namespace, its files are accessed through {root}")
+    global server
+    server = types.SimpleNamespace(data_path=data_path, pid=pid, root=root)
+
+
+def temporary_root():
+    return cfg.temporary_directory / PROGRAM
+
+
+def prepare_temporary_root():
+    """
+        The ClickHouse server writes uncompressed archives to <temporary_directory>/clickhouse-backup/<random name>.
+
+        <temporary_directory> is usually world-writable (/var/tmp), so nothing inside it can be trusted:
+        another local user is able to create a file, a directory or a symbolic link with any name there.
+        The server accepts only paths listed in 'backups.allowed_path', so one directory with a fixed name
+        is unavoidable. It is safe only if it is a real directory, owned by the server user and closed
+        for everybody else. The sticky bit of <temporary_directory> then guarantees that nobody else
+        is able to rename or to replace it.
+    """
+    parent = host_path(cfg.temporary_directory)
+    if not parent.is_dir():
+        raise RuntimeError(f"temporary directory {parent} not found")
+    parent_mode = parent.stat().st_mode
+    if parent_mode & stat.S_IWOTH and not parent_mode & stat.S_ISVTX:
+        raise RuntimeError(f"temporary directory {parent} is world-writable without the sticky bit, it is unsafe")
+    root = host_path(temporary_root())
+    try:
+        os.mkdir(root, 0o700)  # fails if anything with this name already exists, a symbolic link too
+        os.chown(root, cfg.uid, cfg.gid)
+    except FileExistsError:
+        pass
+    status = os.lstat(root)  # lstat: a symbolic link must not be followed
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != cfg.uid or stat.S_IMODE(status.st_mode) != 0o700:
+        raise RuntimeError(
+            f"{root} must be a directory owned by the user {cfg.user} with mode 0700, "
+            "but something else was found there: check what it is and remove it"
+        )
+
+
+def create_temporary_run_directory(backup_timestamp):
+    """ Returns the path of the new directory as the server sees it. """
+    # mkdtemp creates a directory with an unpredictable name, accessible only by its creator
+    path = Path(tempfile.mkdtemp(prefix=f"{backup_timestamp}-", dir=host_path(temporary_root())))
+    os.chown(path, cfg.uid, cfg.gid)  # the server writes there
+    return temporary_root() / path.name
+
+
+def remove_leftovers_of_interrupted_runs():
+    """
+        The lock guarantees that no other instance is running, so every unfinished server-side backup,
+        everything inside the temporary root and every *.partial directory was left by a crashed run.
+    """
+    prefix = f"File('{temporary_root()}/"
+    rows = clickhouse_query(
+        "SELECT query_id, name FROM system.backups WHERE status = 'CREATING_BACKUP'"
+        f" AND startsWith(name, {sql_string(prefix)})"
+    )
+    for row in rows:
+        logger.warning(f"killing unfinished backup {row['name']} left by an interrupted run")
+        kill_backup_query(row["query_id"])
+    for path in sorted(host_path(temporary_root()).iterdir()):
+        logger.warning(f"removing temporary {path} left by an interrupted run")
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    for path in sorted(cfg.backup_root.iterdir()):
+        match = BACKUP_DIRECTORY_REGEX.fullmatch(path.name)
+        if path.is_dir() and match and match.group(2) == ".partial":
+            logger.warning(f"removing directory {path} left by an interrupted run")
+            shutil.rmtree(path)
+
+
+def read_allowed_backup_paths():
+    """ Returns (data path of the server, list of backups.allowed_path values from the effective server configuration). """
+    data_path = server.data_path
+    preprocessed = data_path / "preprocessed_configs" / "config.xml"
+    if not preprocessed.is_file():
+        raise RuntimeError(
+            f"effective server configuration {preprocessed} not found, add {cfg.backup_root}/ and "
+            f"{temporary_root()}/ to <backups><allowed_path> of the server configuration manually"
+        )
+    root = xml.etree.ElementTree.parse(preprocessed).getroot()
+    values = [element.text.strip() for element in root.findall("backups/allowed_path") if element.text]
+    return data_path, values
+
+
+def is_path_allowed(path, data_path, allowed_paths):
+    for value in allowed_paths:
+        allowed = Path(os.path.normpath(data_path / value))  # an absolute value replaces data_path
+        if allowed == path or allowed in path.parents:
+            return True
+    return False
+
+
+def not_allowed_paths(data_path, allowed_paths):
+    # backup_root: RESTORE reads the archives from it, the temporary root: BACKUP writes to it
+    required = [cfg.backup_root, temporary_root()]
+    return [path for path in required if not is_path_allowed(path, data_path, allowed_paths)]
+
+
+def ensure_server_configuration():
+    """
+        The server refuses to read and to write backups outside of 'backups.allowed_path'.
+        Add the required directories to this list, the server applies such change without a restart.
+    """
+    data_path, allowed_paths = read_allowed_backup_paths()
+    missing = not_allowed_paths(data_path, allowed_paths)
+    if not missing:
+        return
+    # elements of the same name are replaced when configuration files are merged,
+    # so already allowed paths are repeated here to keep them allowed
+    values = list(dict.fromkeys(allowed_paths + [f"{path}/" for path in missing]))
+    lines = ["<!-- This file is managed by {0}, do not edit it. -->".format(PROGRAM), "<clickhouse>", "    <backups>"]
+    lines += [f"        <allowed_path>{xml.sax.saxutils.escape(value)}</allowed_path>" for value in values]
+    lines += ["    </backups>", "</clickhouse>", ""]
+    target = cfg.server_config_file
+    if not target.parent.is_dir():
+        raise RuntimeError(f"server configuration directory {target.parent} not found")
+    owner = target.parent.stat()
+    temporary = target.with_name(target.name + ".tmp")  # the server reads only *.xml, *.yaml and *.conf files
+    temporary.write_text("\n".join(lines))
+    os.chown(temporary, owner.st_uid, owner.st_gid)
+    os.chmod(temporary, 0o644)
+    temporary.rename(target)
+    logger.warning(
+        f"server configuration file {target} was written to allow backups in "
+        + ", ".join(str(path) for path in missing)
+    )
+    deadline = time.monotonic() + cfg.server_config_reload_timeout_seconds
+    while time.monotonic() < deadline:
+        if stop_event.wait(1):
+            raise BackupInterrupted("backup was interrupted")
+        data_path, allowed_paths = read_allowed_backup_paths()
+        if not not_allowed_paths(data_path, allowed_paths):
+            return
+    raise RuntimeError(
+        f"server configuration file {target} was written, but the server has not applied it within "
+        f"{cfg.server_config_reload_timeout_seconds} seconds: execute SYSTEM RELOAD CONFIG "
+        "or restart clickhouse-server, and then run the backup again"
+    )
+
+
+def discover_databases():
+    """
+        Returns (sorted list of databases to backup,
+                 dict database -> list of existing excluded tables,
+                 dict database -> list of tables which are saved without data).
+    """
+    rows = clickhouse_query("SELECT name FROM system.databases")
+    existing_databases = set(row["name"] for row in rows) - set(SYSTEM_DATABASES)
+    for database in cfg.exclude_databases:
+        if database not in existing_databases:
+            logger.warning(f"database {database!r} from 'exclude_databases' does not exist")
+    databases = sorted(existing_databases - set(cfg.exclude_databases))
+    for database in cfg.databases:
+        if database not in databases:
+            logger.warning(f"database {database!r} from the section [databases] does not exist or is excluded")
+
+    rows = clickhouse_query("SELECT database, name, engine, total_bytes FROM system.tables")
+    tables = dict()
+    for row in rows:
+        tables.setdefault(row["database"], dict())[row["name"]] = row
+
+    excluded_tables = dict()
+    for database, names in cfg.exclude_tables.items():
+        if database not in existing_databases:
+            logger.warning(f"database {database!r} from 'exclude_tables' does not exist")
+            continue
+        for name in names:
+            if name in tables.get(database, dict()):
+                excluded_tables.setdefault(database, []).append(name)
+            else:
+                logger.warning(f"table {database!r}.{name!r} from 'exclude_tables' does not exist")
+
+    data_excluded_tables = dict()
+    for database in databases:
+        for name, row in sorted(tables.get(database, dict()).items()):
+            if name in excluded_tables.get(database, []):
+                continue
+            engine = row["engine"]
+            if engine.endswith("MergeTree") or engine in ENGINES_WITH_DATA_BACKUP:
+                continue
+            total_bytes = int(row["total_bytes"] or 0)
+            if engine in ENGINES_WITH_DATA_EXCLUDED:
+                data_excluded_tables.setdefault(database, []).append(name)
+            if engine in ENGINES_WITH_DATA_EXCLUDED or engine in ENGINES_WITH_LOCAL_DATA_WITHOUT_BACKUP or total_bytes > 0:
+                if engine in ENGINES_WITH_DATA_EXCLUDED and total_bytes == 0:
+                    continue  # nothing is lost: the table is empty
+                logger.warning(
+                    f"table {database!r}.{name!r}: data of the {engine} engine is not saved to the backup, "
+                    "only the table definition is saved (add the table to 'exclude_tables' to silence this warning)"
+                )
+    return databases, excluded_tables, data_excluded_tables
+
+
+def write_checksum(directory):
+    lines = []
+    for path in sorted(directory.glob("*.tar.zst")):
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            for block in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(block)
+        lines.append(f"SHA256 ({path.name}) = {digest.hexdigest()}\n")  # the format of "sha256sum --tag"
+    checksum = directory / "CHECKSUM"
+    checksum.write_text("".join(lines))
+    os.chown(checksum, cfg.uid, cfg.gid)
+    os.chmod(checksum, 0o640)
+
+
+def delete_old_backups(delete_complete_backups):
+    """
+        Failed backups are deleted by age unconditionally.
+        Complete backups are deleted by age only after a successful run: if backups start to fail
+        every night, the last good backups must not be rotated away.
+    """
+    now = utc_now()
+    for path in sorted(cfg.backup_root.iterdir()):
+        match = BACKUP_DIRECTORY_REGEX.fullmatch(path.name)
+        if not path.is_dir() or not match or match.group(2) == ".partial":
+            logger.warning(f"unexpected path {path}")
+            continue
+        if match.group(2) is None and not delete_complete_backups:
+            continue
+        created = datetime.datetime.strptime(match.group(1), TIMESTAMP_FORMAT).replace(tzinfo=datetime.timezone.utc)
+        if now - created > datetime.timedelta(days=cfg.backup_save_days):
+            logger.info(f"removing old backup {path}")
+            shutil.rmtree(path)
+
+
+def write_statistics(results, sizes, total_timer):
+    width = max((len(label) for label, timer, path, error in results), default=0)
+    logger.info("clickhouse backup statistics:")
+    total_size = 0
+    for label, timer, path, error in results:
+        if error is None:
+            size = sizes[label]
+            total_size += size
+            logger.info(f"++ {timer.hms()} {label:{width}} {format_size(size)} {describe_compression(label)}")
+        else:
+            logger.info(f"-- {timer.hms()} {label:{width}} FAILED")
+    line = "=" * width
+    logger.info(f"== {total_timer.hms()} {line} {format_size(total_size)} compression_threads={cfg.compression_threads}")
+
+
+def clickhouse_backup_main():
+    """ Returns True if a complete backup was created. """
+    total_timer = Timer().start()
+    lock = acquire_lock()
+    prepare_backup_root()
+    detect_server()
+    prepare_temporary_root()
+    remove_leftovers_of_interrupted_runs()
+    ensure_server_configuration()
+    databases, excluded_tables, data_excluded_tables = discover_databases()
+
+    backup_timestamp = utc_now().strftime(TIMESTAMP_FORMAT)
+    final_directory = cfg.backup_root / f"{backup_timestamp}{BACKUP_DIRECTORY_SUFFIX}"
+    failed_directory = cfg.backup_root / f"{backup_timestamp}{BACKUP_DIRECTORY_SUFFIX}.failed"
+    backup_directory = cfg.backup_root / f"{backup_timestamp}{BACKUP_DIRECTORY_SUFFIX}.partial"
+    backup_directory.mkdir(mode=cfg.mode)
+    os.chown(backup_directory, cfg.uid, cfg.gid)
+    os.chmod(backup_directory, cfg.mode)
+    temporary_run_directory = create_temporary_run_directory(backup_timestamp)
+    directories = types.SimpleNamespace(backup=backup_directory, temporary=temporary_run_directory)
+
+    try:
+        tasks = [
+            ("--globals-only", backup_globals, directories),
+            ("--config-only", backup_config, directories),
+        ]
+        if databases:
+            tasks.append(("--schema-only", backup_schema, directories, excluded_tables))
+        for database in databases:
+            tasks.append((
+                database, backup_database, directories, database,
+                excluded_tables.get(database, []), data_excluded_tables.get(database, []),
+            ))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.jobs, thread_name_prefix="backup-") as executor:
+            futures = [executor.submit(run_task, *task) for task in tasks]
+            concurrent.futures.wait(futures, return_when=concurrent.futures.ALL_COMPLETED)
+        results = [future.result() for future in futures]
+
+        failed = [(label, error) for label, timer, path, error in results if error is not None]
+        for label, error in failed:
+            logger.error(f"backup of {label} failed: {error.__class__.__name__}: {error}")
+        for label, timer, path, error in results:
+            if error is None and timer.hours() > setting("warning_threshold_hours", label):
+                logger.warning(f"backup of {label} creation time {timer.hms()} exceeds warning_threshold_hours limit")
+
+        # only verified *.tar.zst archives are kept in the backup directory
+        for path in sorted(backup_directory.iterdir()):
+            if not path.name.endswith(".tar.zst") or path not in [result[2] for result in results]:
+                logger.warning(f"removing unfinished file {path}")
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+        write_checksum(backup_directory)
+        # the directory is renamed below, so the sizes are collected while the paths are still valid
+        sizes = dict((label, path.stat().st_size) for label, timer, path, error in results if error is None)
+        if failed:
+            if any(error is None for label, timer, path, error in results):
+                backup_directory.rename(failed_directory)
+                logger.error(f"backup is incomplete, successfully created archives are kept in {failed_directory}")
+            else:
+                shutil.rmtree(backup_directory)
+                logger.error("backup failed, no archives were created")
+        else:
+            backup_directory.rename(final_directory)
+    except BaseException:
+        # termination by a signal or an unexpected error: leave no garbage behind
+        stop_event.set()
+        shutil.rmtree(backup_directory, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(host_path(temporary_run_directory), ignore_errors=True)
+
+    delete_old_backups(delete_complete_backups=not failed)
+    write_statistics(results, sizes, total_timer)
+    del lock
+    return not failed
+
+
+def main():
+    arguments = parse_arguments()
+    configure_logging()
+    try:
+        init(arguments)
+        succeeded = clickhouse_backup_main()
+    except Exception as exc:
+        logger.error(f"{PROGRAM}: {exc.__class__.__name__}: {exc}")
+        sys.exit(1)
+    sys.exit(0 if succeeded else 1)
+
+
+if __name__ == "__main__":
+    main()
