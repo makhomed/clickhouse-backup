@@ -1,5 +1,5 @@
 
-# clickhouse-backup (version 1.3.0)
+# clickhouse-backup (version 1.5.0)
 
 This tool, clickhouse-backup, saves backups of all databases located on the current ClickHouse server
 to the `/srv/clickhouse-backup/YYYY-MM-DD-HHMMSS-clickhouse-backup` directory:
@@ -47,6 +47,28 @@ cd /opt ; git clone https://github.com/makhomed/clickhouse-backup.git
 cd /opt/clickhouse-backup ; git pull
 ```
 
+### After an upgrade of ClickHouse
+
+clickhouse-backup depends on the behaviour of one particular version of the server. These facts were verified
+with ClickHouse 26.10 and may change in another version:
+
+- the list of table engines whose data is saved by the `BACKUP` statement;
+- `compression_level` is rejected for tar archives, this is why the archive is compressed by an external `zstd`;
+- data of the `Memory` engine can not be restored from a tar archive, this is why it is excluded;
+- a synchronous `BACKUP` sends nothing to the client until it is finished, this is why `ASYNC` is used;
+- `backups.allowed_path` is applied without a restart, and configuration elements with different attributes
+  are appended when the configuration files are merged.
+
+After every upgrade of ClickHouse to a new major version:
+
+1. run `clickhouse-backup --check`;
+2. run one backup and check that its exit code is `0`;
+3. restore one database under another name ([Restore, 2](#2-restore-a-database-under-another-name)),
+   compare the number of rows of its largest table with the original, and drop the restored database.
+
+Restore was tested only with the same version of ClickHouse which has created the archive.
+Keep the old backups until a backup made by the new version is restored successfully.
+
 ## Usage
 
 ```
@@ -58,19 +80,111 @@ Options:
 ```
 --config FILE              configuration file (default: /opt/clickhouse-backup/clickhouse-backup.toml)
 --compression-level LEVEL  zstd compression level from 1 to 19, overrides every level of the configuration file
+--check                    change nothing, print what a real run would do
 --version                  print the version
 ```
 
 Exit code is `0` only if a complete backup was created. Errors and warnings are printed to stderr,
 the full log including statistics is written to the journal: `journalctl -t clickhouse-backup`.
 
+### Check before the first run
+
+```
+/opt/clickhouse-backup/clickhouse-backup --check
+```
+
+`--check` changes nothing and starts no backup. It prints the version and the mount namespace of the server,
+the directories which will be created, whether the server configuration will be changed, the databases
+and tables which will be saved or excluded with their sizes, the required and the available free space,
+and the old backups which will be removed. Exit code is `0` if nothing prevents the backup.
+
+### Connection to the server
+
+clickhouse-backup starts `clickhouse-client` without a user name and a password, so `clickhouse-client` must be
+able to connect by itself: with its configuration file in the home directory of root
+(`~/.config/clickhouse/config.xml` or `~/.clickhouse-client/config.xml`), with `/etc/clickhouse-client/config.xml`,
+or with the file named in the `clickhouse_client_config` key. clickhouse-backup was tested with the `default`
+user which has all privileges; it executes `BACKUP`, `KILL QUERY` and `SELECT` from the `system` database.
+
 ## Automation
+
+Use one of the two ways, not both.
+
+### cron
 
 ```
 # cat /etc/cron.d/clickhouse-backup
 ```
 ```
 0 0 * * * root /opt/clickhouse-backup/clickhouse-backup
+```
+
+cron sends everything printed to stderr by e-mail, if a mail transfer agent is installed.
+
+### systemd timer
+
+```
+# cat /etc/systemd/system/clickhouse-backup.service
+```
+```
+[Unit]
+Description=Backup of ClickHouse databases
+After=clickhouse-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/clickhouse-backup/clickhouse-backup
+TimeoutStartSec=infinity
+
+# optional limits for clickhouse-backup and for the zstd and tar processes started by it,
+# the BACKUP statement itself is executed by the ClickHouse server and is not limited by them
+#Nice=10
+#CPUQuota=400%
+#MemoryMax=4G
+```
+```
+# cat /etc/systemd/system/clickhouse-backup.timer
+```
+```
+[Unit]
+Description=Daily backup of ClickHouse databases
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+```
+systemctl daemon-reload
+systemctl enable --now clickhouse-backup.timer
+```
+
+- `systemctl list-timers clickhouse-backup.timer` shows the time of the last and of the next run.
+- `systemctl status clickhouse-backup.service` shows the result of the last run,
+  `journalctl -u clickhouse-backup.service -t clickhouse-backup` shows its log.
+- `systemctl start clickhouse-backup.service` starts a backup now, `systemctl stop clickhouse-backup.service`
+  cancels the running one cleanly.
+- systemd never starts a second copy of a running service.
+- `Persistent=true` starts a missed backup after the host was down at the scheduled time.
+- With `MemoryMax` a `zstd` process which needs more memory is killed and the backup fails,
+  see [Compression threads and memory](#compression-threads-and-memory).
+
+### Monitoring
+
+Neither cron nor systemd tells you that backups are not started at all. After each complete backup
+clickhouse-backup rewrites the file `/var/lib/clickhouse-backup/last-successful-backup`:
+
+```
+2026-11-14T00:03:12Z 2026-11-14-000001-clickhouse-backup
+```
+
+Its modification time is the time of the last complete backup. Let the monitoring system raise an alarm
+when the file is too old, for example older than 26 hours for a daily backup:
+
+```
+find /var/lib/clickhouse-backup/last-successful-backup -mmin -1560 | grep -q . || echo "NO FRESH BACKUP"
 ```
 
 ## Configuration
@@ -116,11 +230,32 @@ several `zstd` processes may run at the same time.
 ### Server configuration
 
 ClickHouse reads and writes backups only in the directories listed in `backups.allowed_path`.
-If `backup_root` or the temporary directory `/var/tmp/clickhouse-backup` is not in this list, clickhouse-backup
-writes `/etc/clickhouse-server/config.d/clickhouse-backup.xml` which adds them, all other allowed paths are kept.
-This normally happens once, on the first run. ClickHouse applies this change without a restart.
-clickhouse-backup never restarts the server: if the change is not applied within 30 seconds,
-it exits with an error and asks to execute `SYSTEM RELOAD CONFIG` or to restart the server.
+clickhouse-backup needs two of them: `backup_root` and the temporary directory `/var/tmp/clickhouse-backup`.
+If they are not allowed, it writes `/etc/clickhouse-server/config.d/clickhouse-backup.xml`:
+
+```
+<!-- This file is managed by clickhouse-backup, do not edit it. -->
+<clickhouse>
+    <backups>
+        <allowed_path clickhouse_backup="backup_root">/srv/clickhouse-backup/</allowed_path>
+        <allowed_path clickhouse_backup="temporary_directory">/var/tmp/clickhouse-backup/</allowed_path>
+    </backups>
+</clickhouse>
+```
+
+- This normally happens once, on the first run. ClickHouse applies the change without a restart.
+- clickhouse-backup never restarts the server: if the change is not applied within 30 seconds,
+  it exits with an error and asks to execute `SYSTEM RELOAD CONFIG` or to restart the server.
+- The `clickhouse_backup` attribute is essential. When ClickHouse merges configuration files, an element replaces
+  the element with the same name and the same attributes, otherwise it is appended. An `allowed_path` element
+  without attributes in `config.d` therefore replaces a path of the main configuration; the elements above
+  are appended and never replace the paths allowed by the administrator.
+- The file contains only what clickhouse-backup needs now. If `backup_root` or `temporary_directory` is changed,
+  the old directory is removed from the file and stops being allowed.
+- If the administrator has already allowed a directory or its parent in another configuration file,
+  it is not repeated here. If both directories are allowed this way, the file is removed.
+- clickhouse-backup refuses to overwrite a file with this name which it has not written itself.
+- `clickhouse-backup --check` shows what will be changed.
 
 ### Limiting the load
 
@@ -168,6 +303,21 @@ Uncompressed tar archives are written to `<temporary_directory>/clickhouse-backu
 `temporary_directory` is `/var/tmp` by default. Free space equal to the uncompressed size of the largest
 database is required there.
 
+#### Where to place the temporary directory
+
+- **Keep it off the file system which holds the data of ClickHouse** (`/var/lib/clickhouse`), if you can.
+  If the temporary directory shares a file system with the data and this file system becomes full
+  during a backup, ClickHouse is unable to write: inserts and merges fail until the space is freed.
+  On a separate file system only the backup fails. The same is true for `backup_root`.
+- A separate device also makes the backup faster and lighter: `zstd` reads the tar archive from the temporary
+  directory and writes the compressed archive to `backup_root`; on one device these reads and writes compete
+  with each other and with the queries of the server.
+- Do not use a `tmpfs` (`/tmp` is a `tmpfs` on many systems): the uncompressed archive would be kept in memory.
+- `clickhouse-backup --check` shows whether the temporary directory and `backup_root` are on the same file system:
+  the "free space" section then contains one line instead of two. Compare with `df /var/lib/clickhouse`.
+
+#### Protection of the temporary files
+
 `/var/tmp` is world-writable, so the temporary files are protected from other local users:
 
 - `/var/tmp/clickhouse-backup` must be a real directory owned by the `clickhouse` user with mode `0700`.
@@ -187,6 +337,10 @@ the PID of the server from the `status` file in the data directory of the server
 of both processes, and if they differ, it works with the temporary files through `/proc/<pid>/root`.
 The journal then contains the line `clickhouse-server has its own mount namespace`.
 
+Access through `/proc/<pid>/root` was tested with SELinux disabled only. With SELinux in the enforcing mode
+it may be denied, depending on the domain in which clickhouse-backup is started: run `clickhouse-backup --check`
+and one real backup after `PrivateTmp=yes` is enabled, and look for denials with `ausearch -m avc -ts recent`.
+
 With `PrivateTmp=yes` systemd also mounts everything listed for `/tmp` and `/var/tmp` in `/etc/fstab` before
 the service starts. Check where `/var/tmp` of the server really is, and how much space is there:
 
@@ -194,8 +348,40 @@ the service starts. Check where `/var/tmp` of the server really is, and how much
 df -h /proc/$(systemctl show clickhouse-server -p MainPID --value)/root/var/tmp
 ```
 
+### Free space
+
+Before anything is started, clickhouse-backup compares the size of the databases with the free space
+(the `free_space_check` key, `true` by default):
+
+- the temporary directory must hold the uncompressed data of the largest database
+  (of the `jobs` largest databases, if `jobs` is greater than 1);
+- `backup_root` must hold the data of all databases, as if it were not compressible at all;
+- 10% are added to both numbers;
+- if the temporary directory and `backup_root` are on the same file system, the two numbers are added together
+  and compared with the free space of this file system; if they are on different file systems,
+  each number is compared with the free space of its own file system.
+
+If there is not enough space, nothing is started, the server configuration is not touched, the exit code is `1`.
+`clickhouse-backup --check` prints the required and the available space.
+
+Limitations of this check:
+
+- **The estimate for `backup_root` is intentionally too high.** The size of the compressed archives is not known
+  in advance, so the worst case is assumed: no compression at all. Real archives are usually much smaller.
+  On a disk which is almost full the check may therefore refuse a backup which would have fit.
+  In this case free some space, reduce `backup_save_days`, or set `free_space_check = false`.
+- **The check is made once, at the start.** It does not protect from a disk which is filled by something else
+  while the backup is running, and it does not see the data inserted into the databases after the start.
+  If the disk becomes full during the backup, the `BACKUP` statement or `zstd` fails, the backup of this
+  database is counted as failed and its unfinished files are removed.
+- With `free_space_check = false` nothing is checked: a backup which does not fit fails in the middle,
+  after it has filled the disk. If this disk also holds the data of ClickHouse, inserts fail at that moment.
+
 ### Failures
 
+- The backup of one database is cancelled and counted as failed if it takes more than `backup_timeout_hours`,
+  `24` by default: the `BACKUP` query is killed on the server. Without this limit a hung backup
+  would hold the lock forever.
 - If the backup of at least one database fails, the directory is renamed to `<timestamp>-clickhouse-backup.failed`.
   It contains only the verified archives of other databases. The exit code is `1`.
 - Complete backups older than `backup_save_days` are removed only after a successful run, so repeated
@@ -225,6 +411,24 @@ df -h /proc/$(systemctl show clickhouse-server -p MainPID --value)/root/var/tmp
   again after the restore, so the source must be available.
 - clickhouse-backup prints a warning for every table whose local data is not saved.
   Add the table to `exclude_tables` to silence the warning, then its definition is not saved either.
+
+### Secrets in the backup
+
+A backup directory contains secrets, protect it as carefully as the server itself:
+
+- the `config-only` archive contains `/etc/clickhouse-server` with `users.xml` and `users.d`: passwords or
+  password hashes of the users, and every other secret written to the configuration (credentials of
+  dictionaries and of external storages, keys of encrypted disks, private keys of TLS certificates, if they
+  are kept in this directory), and `/etc/clickhouse-client` with the passwords saved for the client;
+- the `globals-only` archive contains the password hashes of the users created by SQL,
+  and the named collections with their credentials;
+- the archives of the databases contain the definitions of tables and dictionaries, which may include
+  credentials of external sources.
+
+`backup_root` and the directories of the backups have mode `0700` and belong to the `clickhouse` user,
+the archives have mode `0640`. The archives are not encrypted. Every copy of this directory made by other tools
+(file system snapshots, replication to another host, an external backup system) carries the same secrets:
+check who is able to read them there.
 
 ### Consistency
 
@@ -323,12 +527,12 @@ tar --zstd -xf 2026-11-14-000001--config-only.tar.zst -C /root/restored-config
 1. Install the same version of ClickHouse, restore the configuration (6) and start the server.
 2. Copy the backup directory to `/srv/clickhouse-backup`, run `chown -R clickhouse:clickhouse /srv/clickhouse-backup`.
 3. Install clickhouse-backup and run it once: it adds `/srv/clickhouse-backup` to `backups.allowed_path`.
-   Or create `/etc/clickhouse-server/config.d/clickhouse-backup.xml` by hand:
+   Or allow the directory by hand in a file with another name, for example
+   `/etc/clickhouse-server/config.d/restore.xml`; the attribute keeps the paths of the main configuration allowed:
    ```
    <clickhouse>
        <backups>
-           <allowed_path>backups</allowed_path>
-           <allowed_path>/srv/clickhouse-backup/</allowed_path>
+           <allowed_path restore="1">/srv/clickhouse-backup/</allowed_path>
        </backups>
    </clickhouse>
    ```
@@ -357,6 +561,30 @@ clickhouse-client --query "SELECT id, name, status, error, start_time, end_time 
 ```
 
 Test the restore procedure regularly: a backup which was never restored is only a hope.
+
+## Troubleshooting
+
+All messages are printed to stderr and written to the journal: `journalctl -t clickhouse-backup --since today`.
+
+| message or symptom | cause | what to do |
+|--------------------|-------|------------|
+| `another instance of clickhouse-backup is already running` | The previous run is still working or hangs. | `pgrep -af clickhouse-backup`, and look at the running backups: `SELECT name, status, start_time FROM system.backups WHERE status = 'CREATING_BACKUP'`. Send SIGTERM to a hung run: it kills its `BACKUP` query and cleans up. Never remove the lock file by hand. |
+| `backup is not finished within backup_timeout_hours = N hours` | One database took longer than the limit, its `BACKUP` query was killed. | Raise `backup_timeout_hours`, or remove a too low `max_backup_bandwidth`. |
+| `not enough free space in DIR: X required, Y available` | The estimate of the required space is higher than the free space. | Free some space or reduce `backup_save_days`. The estimate for `backup_root` assumes no compression: if you know that the backup fits, set `free_space_check = false`. See [Free space](#free-space). |
+| `DIR must be a directory owned by the user clickhouse with mode 0700, but something else was found there` | A file, a symbolic link or a directory of another user occupies the name of the temporary directory. | Look at it (`ls -ld DIR`), find out who has created it, remove it. |
+| `server configuration file FILE was changed, but the server has not applied it within N seconds` | The server has not reloaded its configuration. | `clickhouse-client --query "SYSTEM RELOAD CONFIG"`, then run the backup again. Look for errors of the configuration in `/var/log/clickhouse-server/clickhouse-server.err.log`. |
+| `server configuration file FILE exists, but it was not written by clickhouse-backup` | Somebody has created a file with the name which clickhouse-backup uses. | Rename the file, or set another name in the `server_config_file` key. |
+| `Authentication failed` or `AUTHENTICATION_FAILED` in the message | `clickhouse-client` has found no valid user name and password. | Check `clickhouse-client --query "SELECT 1"` as root. Set `clickhouse_client_config` to a file with the credentials, see [Connection to the server](#connection-to-the-server). |
+| `Connection refused` in the message | The server is not running or does not listen on the address used by `clickhouse-client`. | `systemctl status clickhouse-server`. |
+| `backup of NAME failed: ...` and a directory with the `.failed` suffix | The backup of one database has failed, the reason is in the message. The other archives in this directory are complete and verified. | Fix the reason and run the backup again. The archives of a `.failed` directory can be used for a restore. Complete backups are not rotated away while backups fail. |
+| `backup status is BACKUP_FAILED: ...` | The `BACKUP` statement has failed inside the server, its error follows. | Read the error; the full text is in `SELECT error FROM system.backups ORDER BY start_time DESC LIMIT 1`. |
+| `server reported a successful backup, but FILE does not exist` | The server and clickhouse-backup see different file systems, and the server was not detected correctly. | Check that the server runs on this host and that `<data path>/status` contains its PID. |
+| `table 'DB'.'TABLE': data of the ENGINE engine is not saved to the backup` | A warning, not an error: `BACKUP` does not save data of this engine. | Nothing, if the data is not needed. Add the table to `exclude_tables` to silence the warning. See [What is saved, and what is not](#what-is-saved-and-what-is-not). |
+| `unexpected path PATH` | A warning: `backup_root` contains something which is not a backup directory. | Remove or move it. |
+| `removing directory ... left by an interrupted run`, `killing unfinished backup ...` | A warning: the previous run was killed or the host was rebooted during a backup. This run has cleaned up after it. | Nothing. |
+| `backup of NAME creation time HH:MM:SS exceeds warning_threshold_hours limit` | A warning: the backup of this database is slower than expected. | Raise `warning_threshold_hours` for this database, or find out why it has become slower. |
+| `TOML parser not found` | Python is older than 3.11 and the `tomli` module is not installed. | `python3 -m pip install tomli` |
+| The file `last-successful-backup` is old, and there are no messages at all | The backup is not started: cron or the timer does not work. | `systemctl list-timers clickhouse-backup.timer` or `systemctl status crond`, then start the backup by hand. |
 
 ## License
 

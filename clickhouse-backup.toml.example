@@ -19,6 +19,30 @@
 # (of the 'jobs' largest databases, if jobs > 1).
 #temporary_directory = "/var/tmp"
 
+# Before the backup is started, clickhouse-backup compares the size of the databases with the free space:
+# - the temporary directory must hold the uncompressed data of the largest database
+#   (of the 'jobs' largest databases, if jobs > 1);
+# - backup_root must hold the data of all databases, as if it were not compressible at all;
+# - 10% are added to both numbers.
+# If there is not enough space, nothing is started and the exit code is 1.
+# Use "clickhouse-backup --check" to see the numbers.
+# The estimate for backup_root is intentionally too high, so on an almost full disk the check may
+# refuse a backup which would have fit: then set it to false. The check is made once, at the start:
+# it does not protect from a disk filled by something else while the backup is running.
+#free_space_check = true
+
+# The backup of one database (the BACKUP statement, the compression and the verification together)
+# is cancelled and counted as failed if it takes more than this number of hours.
+# A hung backup would otherwise hold the lock forever, and all following runs would fail.
+#backup_timeout_hours = 24
+
+# This file is rewritten after each complete backup: it contains the UTC time and the name of the
+# backup directory, its modification time is the time of the last complete backup.
+# Let the monitoring system raise an alarm when this file is older than, for example, 26 hours:
+#     find /var/lib/clickhouse-backup/last-successful-backup -mmin -1560 | grep -q . || echo "NO FRESH BACKUP"
+# An empty string disables the file.
+#success_file = "/var/lib/clickhouse-backup/last-successful-backup"
+
 # Complete backups older than this number of days are removed after each successful run.
 #backup_save_days = 7
 
@@ -95,8 +119,12 @@
 # Directories saved to the "config-only" archive.
 #config_directories = ["/etc/clickhouse-server", "/etc/clickhouse-client"]
 
-# Configuration file for clickhouse-client (the --config-file option), put the user name and
-# the password here if the 'default' user without password is not allowed to connect.
+# Configuration file for clickhouse-client (the --config-file option) with the user name and the password.
+# If it is empty, clickhouse-client looks for its configuration as usual: ~/.config/clickhouse/config.xml,
+# ~/.clickhouse-client/config.xml, /etc/clickhouse-client/config.xml. The home directory of root is used
+# even if clickhouse-backup is started by systemd, which does not set HOME.
+# An explicit file makes the backup independent of the environment:
+#     <config><user>default</user><password>...</password></config>     (owner root, mode 0600)
 #clickhouse_client_config = ""
 
 # Server configuration file managed by clickhouse-backup, it contains 'backups.allowed_path'.

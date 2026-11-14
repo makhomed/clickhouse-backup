@@ -2,7 +2,7 @@
 
 __license__ = "GNU General Public License, version 3.0 or later"
 __contact__ = "https://github.com/makhomed/clickhouse-backup"
-__version__ = "1.3.0"
+__version__ = "1.5.0"
 
 try:
     import tomllib  # https://docs.python.org/3/library/tomllib.html
@@ -70,6 +70,9 @@ configuration_defaults = dict(
     compression_threads = 4,
     compression_nice = 10,
     max_backup_bandwidth = 0,
+    backup_timeout_hours = 24,
+    free_space_check = True,
+    success_file = "/var/lib/clickhouse-backup/last-successful-backup",
     warning_threshold_hours = 4,
     exclude_databases = [],
     exclude_tables = {},
@@ -119,11 +122,19 @@ logger = logging.getLogger(PROGRAM)
 
 stop_event = threading.Event()  # set when the script is asked to terminate by a signal
 
+task_state = threading.local()  # task_state.deadline: time.monotonic() value at which the current task must give up
+
 child_environment = None
 
 
 class BackupInterrupted(Exception):
     pass
+
+
+def check_task_deadline():
+    deadline = getattr(task_state, "deadline", None)
+    if deadline is not None and time.monotonic() > deadline:
+        raise RuntimeError(f"backup is not finished within backup_timeout_hours = {cfg.backup_timeout_hours} hours")
 
 
 def parse_arguments():
@@ -140,6 +151,11 @@ def parse_arguments():
         "--compression-level", type=int, default=None, choices=range(1, 20), metavar="LEVEL",
         help="zstd compression level, from 1 to 19, overrides every 'compression_level' key of the"
              f" configuration file (default: {configuration_defaults['compression_level']})",
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="change nothing and start no backup: print what will be saved, what will be changed"
+             " and whether there is enough free space; exit code is 0 if nothing prevents the backup",
     )
     return parser.parse_args()
 
@@ -198,7 +214,8 @@ def read_configuration(arguments):
     # the command line overrides the configuration file, the sections [databases.<name>] too
     values["command_line_compression_level"] = arguments.compression_level
 
-    for key in ("backup_root", "temporary_directory", "clickhouse_client", "clickhouse_client_config", "zstd", "tar", "nice",
+    for key in ("backup_root", "temporary_directory", "success_file",
+                "clickhouse_client", "clickhouse_client_config", "zstd", "tar", "nice",
                 "user", "group", "server_config_file"):
         require_type(key, values[key], str)
     for key in ("backup_save_days", "mode", "server_config_reload_timeout_seconds",
@@ -208,6 +225,14 @@ def read_configuration(arguments):
         raise ValueError(
             f"configuration key 'compression_nice': expected -20 <= value <= 19, got {values['compression_nice']}"
         )
+    require_type("free_space_check", values["free_space_check"], bool)
+    require_type("backup_timeout_hours", values["backup_timeout_hours"], (int, float))
+    if values["backup_timeout_hours"] <= 0:
+        raise ValueError(
+            f"configuration key 'backup_timeout_hours': expected value > 0, got {values['backup_timeout_hours']}"
+        )
+    if values["success_file"] and not Path(values["success_file"]).is_absolute():
+        raise ValueError(f"configuration key 'success_file': expected absolute path, got {values['success_file']}")
     if values["max_backup_bandwidth"] < 0:
         raise ValueError(
             f"configuration key 'max_backup_bandwidth': expected value >= 0, got {values['max_backup_bandwidth']}"
@@ -282,15 +307,31 @@ def register_exit_signal_handlers():
         signal.signal(sig, handle_exit_signal)
 
 
-def configure_logging():
+def stderr_is_journal():
+    """
+        systemd sets JOURNAL_STREAM to "<device>:<inode>" of the journal socket connected to stderr of a service.
+        In this case every message written to stderr would appear in the journal twice.
+    """
+    try:
+        status = os.fstat(sys.stderr.fileno())
+    except (OSError, ValueError):
+        return False
+    return os.environ.get("JOURNAL_STREAM") == f"{status.st_dev}:{status.st_ino}"
+
+
+def configure_logging(use_journal):
     root_logger = logging.getLogger("")
     root_logger.setLevel(logging.INFO)
 
-    console_log_formatter = logging.Formatter('%(message)s')
-    console_log_handler = logging.StreamHandler()
-    console_log_handler.setFormatter(console_log_formatter)
-    console_log_handler.setLevel(logging.WARNING)
-    root_logger.addHandler(console_log_handler)
+    if not (use_journal and stderr_is_journal()):
+        console_log_formatter = logging.Formatter('%(message)s')
+        console_log_handler = logging.StreamHandler()
+        console_log_handler.setFormatter(console_log_formatter)
+        console_log_handler.setLevel(logging.WARNING)
+        root_logger.addHandler(console_log_handler)
+
+    if not use_journal:
+        return
 
     journal_log_formatter = logging.Formatter('%(message)s')
     journal_log_handler = systemd.journal.JournalHandler(SYSLOG_IDENTIFIER=PROGRAM)
@@ -307,6 +348,9 @@ def init(arguments):
     global child_environment
     child_environment = dict(os.environ)
     child_environment["LC_ALL"] = "C"
+    # clickhouse-client looks for its configuration file (user name, password) in the home directory.
+    # systemd starts a service of root without HOME, cron and a login shell set it: make all three equal.
+    child_environment.setdefault("HOME", pwd.getpwuid(os.getuid()).pw_dir)
 
 
 class Timer:
@@ -391,10 +435,18 @@ def run_command(command, capture_stdout=False, interruptible=True):
             stdout, stderr = process.communicate(timeout=1)
             break
         except subprocess.TimeoutExpired:
-            if interruptible and stop_event.is_set():
+            if not interruptible:
+                continue
+            if stop_event.is_set():
                 process.terminate()
                 process.communicate()
                 raise BackupInterrupted(f"command {command[0]} was terminated")
+            try:
+                check_task_deadline()
+            except RuntimeError:
+                process.terminate()
+                process.communicate()
+                raise
     if process.returncode != 0:
         raise RuntimeError(f"command {command[0]} failed with exit code {process.returncode}: {stderr.strip()}")
     return stdout
@@ -466,6 +518,7 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
                 raise RuntimeError(f"backup status is {status}: {error}")
             if stop_event.wait(delay):
                 raise BackupInterrupted(f"backup {backup_id} was interrupted")
+            check_task_deadline()  # the "except" below kills the query on the server
             delay = min(delay * 2, 5.0)
     except BaseException:
         kill_backup_query(backup_id)
@@ -582,6 +635,7 @@ def backup_database(directories, database, excluded_tables, data_excluded_tables
 def run_task(label, function, *args):
     """ Returns (label, timer, archive path or None, exception or None), never raises. """
     timer = Timer().start()
+    task_state.deadline = time.monotonic() + cfg.backup_timeout_hours * 3600
     try:
         if stop_event.is_set():
             raise BackupInterrupted("backup was interrupted")
@@ -658,24 +712,40 @@ def prepare_temporary_root():
         for everybody else. The sticky bit of <temporary_directory> then guarantees that nobody else
         is able to rename or to replace it.
     """
+    exists, problem = inspect_temporary_root()
+    if problem is not None:
+        raise RuntimeError(problem)
+    if not exists:
+        root = host_path(temporary_root())
+        try:
+            os.mkdir(root, 0o700)  # fails if anything with this name already exists, a symbolic link too
+            os.chown(root, cfg.uid, cfg.gid)
+        except FileExistsError:
+            pass
+        exists, problem = inspect_temporary_root()  # somebody could create it between the two calls
+        if problem is not None or not exists:
+            raise RuntimeError(problem or f"unable to create {root}")
+
+
+def inspect_temporary_root():
+    """ Change nothing. Returns (whether the temporary root exists, description of the problem or None). """
     parent = host_path(cfg.temporary_directory)
     if not parent.is_dir():
-        raise RuntimeError(f"temporary directory {parent} not found")
+        return False, f"temporary directory {parent} not found"
     parent_mode = parent.stat().st_mode
     if parent_mode & stat.S_IWOTH and not parent_mode & stat.S_ISVTX:
-        raise RuntimeError(f"temporary directory {parent} is world-writable without the sticky bit, it is unsafe")
+        return False, f"temporary directory {parent} is world-writable without the sticky bit, it is unsafe"
     root = host_path(temporary_root())
     try:
-        os.mkdir(root, 0o700)  # fails if anything with this name already exists, a symbolic link too
-        os.chown(root, cfg.uid, cfg.gid)
-    except FileExistsError:
-        pass
-    status = os.lstat(root)  # lstat: a symbolic link must not be followed
+        status = os.lstat(root)  # lstat: a symbolic link must not be followed
+    except FileNotFoundError:
+        return False, None
     if not stat.S_ISDIR(status.st_mode) or status.st_uid != cfg.uid or stat.S_IMODE(status.st_mode) != 0o700:
-        raise RuntimeError(
+        return True, (
             f"{root} must be a directory owned by the user {cfg.user} with mode 0700, "
             "but something else was found there: check what it is and remove it"
         )
+    return True, None
 
 
 def create_temporary_run_directory(backup_timestamp):
@@ -712,71 +782,148 @@ def remove_leftovers_of_interrupted_runs():
             shutil.rmtree(path)
 
 
+SERVER_CONFIG_HEADER = f"<!-- This file is managed by {PROGRAM}, do not edit it. -->"
+SERVER_CONFIG_ATTRIBUTE = "clickhouse_backup"  # marks the allowed_path elements written by clickhouse-backup
+
+
 def read_allowed_backup_paths():
-    """ Returns (data path of the server, list of backups.allowed_path values from the effective server configuration). """
-    data_path = server.data_path
-    preprocessed = data_path / "preprocessed_configs" / "config.xml"
+    """
+        Read 'backups.allowed_path' from the effective configuration of the server.
+        Returns (foreign, managed):
+            foreign  values allowed by the configuration files of the administrator
+            managed  values written by clickhouse-backup, they carry SERVER_CONFIG_ATTRIBUTE
+    """
+    preprocessed = server.data_path / "preprocessed_configs" / "config.xml"
     if not preprocessed.is_file():
         raise RuntimeError(
             f"effective server configuration {preprocessed} not found, add {cfg.backup_root}/ and "
             f"{temporary_root()}/ to <backups><allowed_path> of the server configuration manually"
         )
-    root = xml.etree.ElementTree.parse(preprocessed).getroot()
-    values = [element.text.strip() for element in root.findall("backups/allowed_path") if element.text]
-    return data_path, values
+    foreign = []
+    managed = []
+    for element in xml.etree.ElementTree.parse(preprocessed).getroot().findall("backups/allowed_path"):
+        if not element.text:
+            continue
+        if element.get(SERVER_CONFIG_ATTRIBUTE) is None:
+            foreign.append(element.text.strip())
+        else:
+            managed.append(element.text.strip())
+    return foreign, managed
 
 
-def is_path_allowed(path, data_path, allowed_paths):
+def is_path_allowed(path, allowed_paths):
     for value in allowed_paths:
-        allowed = Path(os.path.normpath(data_path / value))  # an absolute value replaces data_path
+        allowed = Path(os.path.normpath(server.data_path / value))  # an absolute value replaces the data path
         if allowed == path or allowed in path.parents:
             return True
     return False
 
 
-def not_allowed_paths(data_path, allowed_paths):
-    # backup_root: RESTORE reads the archives from it, the temporary root: BACKUP writes to it
-    required = [cfg.backup_root, temporary_root()]
-    return [path for path in required if not is_path_allowed(path, data_path, allowed_paths)]
+def plan_server_configuration():
+    """
+        Change nothing. Decide what the server configuration file of clickhouse-backup must contain.
+
+        The server refuses to read and to write backups outside of 'backups.allowed_path'.
+        Two directories are required: RESTORE reads the archives from backup_root, BACKUP writes to
+        the temporary root.
+
+        When ClickHouse merges configuration files, an element replaces the element with the same name
+        and the same attributes, otherwise it is appended (ConfigProcessor::mergeRecursive, verified with
+        ClickHouse 26.10). An allowed_path element without attributes in this file would therefore replace
+        a path allowed by the administrator. The elements written here carry their own attribute:
+        they are always appended, they never replace anything, and they can be told apart from
+        the paths of the administrator, so a path which is not required any more can be removed.
+
+        Returns types.SimpleNamespace:
+            action   "none", "write" or "remove"
+            text     new content of the file, for "write"
+            add      values which become allowed
+            remove   values which stop being allowed
+            required the two required directories as Path objects
+    """
+    foreign, managed = read_allowed_backup_paths()
+    target = cfg.server_config_file
+    current = target.read_text() if target.is_file() else None
+    own_file = current is not None and current.startswith(SERVER_CONFIG_HEADER)
+    if current is not None and not own_file:
+        raise RuntimeError(
+            f"server configuration file {target} exists, but it was not written by {PROGRAM}: "
+            "rename it, or set another name in the 'server_config_file' key"
+        )
+    if own_file and SERVER_CONFIG_ATTRIBUTE not in current:
+        # The file was written by clickhouse-backup before version 1.5.0, without attributes, and it repeats
+        # the paths of the administrator. It is not known which of its values are whose, so none of them
+        # is counted as allowed by the administrator: the file is rewritten in the new format, and the
+        # paths of the administrator stay allowed by the files in which they are really defined.
+        legacy = [xml.sax.saxutils.unescape(value) for value in re.findall(r"<allowed_path>(.*?)</allowed_path>", current)]
+        foreign = [value for value in foreign if value not in legacy]
+    required = [
+        ("backup_root", cfg.backup_root),
+        ("temporary_directory", temporary_root()),
+    ]
+    # a required directory may be already allowed by the administrator, for example by its parent
+    needed = [(name, path) for name, path in required if not is_path_allowed(path, foreign)]
+    needed_values = [f"{path}/" for name, path in needed]
+    plan = types.SimpleNamespace(
+        action="none", text=None, required=[path for name, path in required],
+        add=[value for value in needed_values if value not in managed],
+        remove=[value for value in managed if value not in needed_values],
+    )
+    if needed:
+        lines = [SERVER_CONFIG_HEADER, "<clickhouse>", "    <backups>"]
+        for name, path in needed:
+            value = xml.sax.saxutils.escape(f"{path}/")
+            lines.append(f'        <allowed_path {SERVER_CONFIG_ATTRIBUTE}="{name}">{value}</allowed_path>')
+        lines += ["    </backups>", "</clickhouse>", ""]
+        plan.text = "\n".join(lines)
+        if plan.text != current:
+            plan.action = "write"
+    elif own_file:
+        plan.action = "remove"  # everything required is allowed by the administrator, the own file is not needed
+    return plan
+
+
+def describe_server_configuration_change(plan):
+    parts = []
+    if plan.add:
+        parts.append("allows backups in " + ", ".join(plan.add))
+    if plan.remove:
+        parts.append("no longer allows backups in " + ", ".join(plan.remove))
+    if not parts:
+        parts.append("the list of allowed paths is not changed")
+    return "; ".join(parts)
 
 
 def ensure_server_configuration():
-    """
-        The server refuses to read and to write backups outside of 'backups.allowed_path'.
-        Add the required directories to this list, the server applies such change without a restart.
-    """
-    data_path, allowed_paths = read_allowed_backup_paths()
-    missing = not_allowed_paths(data_path, allowed_paths)
-    if not missing:
+    """ Bring the server configuration file to the planned state, the server applies it without a restart. """
+    plan = plan_server_configuration()
+    if plan.action == "none":
         return
-    # elements of the same name are replaced when configuration files are merged,
-    # so already allowed paths are repeated here to keep them allowed
-    values = list(dict.fromkeys(allowed_paths + [f"{path}/" for path in missing]))
-    lines = ["<!-- This file is managed by {0}, do not edit it. -->".format(PROGRAM), "<clickhouse>", "    <backups>"]
-    lines += [f"        <allowed_path>{xml.sax.saxutils.escape(value)}</allowed_path>" for value in values]
-    lines += ["    </backups>", "</clickhouse>", ""]
     target = cfg.server_config_file
-    if not target.parent.is_dir():
-        raise RuntimeError(f"server configuration directory {target.parent} not found")
-    owner = target.parent.stat()
-    temporary = target.with_name(target.name + ".tmp")  # the server reads only *.xml, *.yaml and *.conf files
-    temporary.write_text("\n".join(lines))
-    os.chown(temporary, owner.st_uid, owner.st_gid)
-    os.chmod(temporary, 0o644)
-    temporary.rename(target)
-    logger.warning(
-        f"server configuration file {target} was written to allow backups in "
-        + ", ".join(str(path) for path in missing)
-    )
+    if plan.action == "remove":
+        target.unlink()
+        logger.warning(f"server configuration file {target} was removed: {describe_server_configuration_change(plan)}")
+    else:
+        if not target.parent.is_dir():
+            raise RuntimeError(f"server configuration directory {target.parent} not found")
+        owner = target.parent.stat()
+        temporary = target.with_name(target.name + ".tmp")  # the server reads only *.xml, *.yaml and *.conf files
+        temporary.write_text(plan.text)
+        os.chown(temporary, owner.st_uid, owner.st_gid)
+        os.chmod(temporary, 0o644)
+        temporary.rename(target)
+        logger.warning(f"server configuration file {target} was written: {describe_server_configuration_change(plan)}")
+
     deadline = time.monotonic() + cfg.server_config_reload_timeout_seconds
     while time.monotonic() < deadline:
         if stop_event.wait(1):
             raise BackupInterrupted("backup was interrupted")
-        data_path, allowed_paths = read_allowed_backup_paths()
-        if not not_allowed_paths(data_path, allowed_paths):
+        foreign, managed = read_allowed_backup_paths()
+        required_are_allowed = all(is_path_allowed(path, foreign + managed) for path in plan.required)
+        if required_are_allowed and not any(value in managed for value in plan.remove):
             return
     raise RuntimeError(
-        f"server configuration file {target} was written, but the server has not applied it within "
+        f"server configuration file {target} was changed, but the server has not applied it within "
         f"{cfg.server_config_reload_timeout_seconds} seconds: execute SYSTEM RELOAD CONFIG "
         "or restart clickhouse-server, and then run the backup again"
     )
@@ -784,9 +931,13 @@ def ensure_server_configuration():
 
 def discover_databases():
     """
-        Returns (sorted list of databases to backup,
-                 dict database -> list of existing excluded tables,
-                 dict database -> list of tables which are saved without data).
+        Returns the plan of the backup:
+            plan.databases             sorted list of databases to backup
+            plan.excluded_databases    sorted list of existing databases which are not saved
+            plan.excluded_tables       dict database -> list of existing excluded tables
+            plan.data_excluded_tables  dict database -> list of tables which are saved without data
+            plan.table_counts          dict database -> number of saved tables
+            plan.sizes                 dict database -> size of the data to save, in bytes
     """
     rows = clickhouse_query("SELECT name FROM system.databases")
     existing_databases = set(row["name"] for row in rows) - set(SYSTEM_DATABASES)
@@ -815,12 +966,20 @@ def discover_databases():
                 logger.warning(f"table {database!r}.{name!r} from 'exclude_tables' does not exist")
 
     data_excluded_tables = dict()
+    table_counts = dict()
+    sizes = dict()
     for database in databases:
+        table_counts[database] = 0
+        sizes[database] = 0
         for name, row in sorted(tables.get(database, dict()).items()):
             if name in excluded_tables.get(database, []):
                 continue
+            table_counts[database] += 1
             engine = row["engine"]
             if engine.endswith("MergeTree") or engine in ENGINES_WITH_DATA_BACKUP:
+                # total_bytes of a materialized view repeats the size of its inner table
+                if engine != "MaterializedView":
+                    sizes[database] += int(row["total_bytes"] or 0)
                 continue
             total_bytes = int(row["total_bytes"] or 0)
             if engine in ENGINES_WITH_DATA_EXCLUDED:
@@ -832,7 +991,62 @@ def discover_databases():
                     f"table {database!r}.{name!r}: data of the {engine} engine is not saved to the backup, "
                     "only the table definition is saved (add the table to 'exclude_tables' to silence this warning)"
                 )
-    return databases, excluded_tables, data_excluded_tables
+    return types.SimpleNamespace(
+        databases=databases,
+        excluded_databases=sorted(existing_databases & set(cfg.exclude_databases)),
+        excluded_tables=excluded_tables,
+        data_excluded_tables=data_excluded_tables,
+        table_counts=table_counts,
+        sizes=sizes,
+    )
+
+
+FREE_SPACE_RESERVE = 1.1  # 10% above the estimate
+
+
+def nearest_existing_directory(path):
+    while not path.is_dir():
+        path = path.parent
+    return path
+
+
+def free_space_report(plan):
+    """
+        Change nothing. Returns the list of (directory, required bytes, available bytes) per file system.
+
+        The temporary directory holds uncompressed tar archives of the databases which are processed
+        at the same moment: of the 'jobs' largest ones in the worst case.
+        backup_root holds the compressed archives, their size is not known in advance, so the worst
+        case is assumed: the data is not compressible at all.
+    """
+    largest = sorted(plan.sizes.values(), reverse=True)[:cfg.jobs]
+    locations = [
+        (nearest_existing_directory(host_path(temporary_root())), sum(largest)),
+        (nearest_existing_directory(cfg.backup_root), sum(plan.sizes.values())),
+    ]
+    required_by_device = dict()
+    directory_by_device = dict()
+    for directory, required in locations:
+        device = directory.stat().st_dev
+        required_by_device[device] = required_by_device.get(device, 0) + required
+        directory_by_device.setdefault(device, directory)
+    report = []
+    for device, required in required_by_device.items():
+        directory = directory_by_device[device]
+        status = os.statvfs(directory)
+        report.append((directory, int(required * FREE_SPACE_RESERVE), status.f_bavail * status.f_frsize))
+    return report
+
+
+def check_free_space(plan):
+    if not cfg.free_space_check:
+        return
+    for directory, required, available in free_space_report(plan):
+        if available < required:
+            raise RuntimeError(
+                f"not enough free space in {directory}: {format_size(required)} required, "
+                f"{format_size(available)} available (set free_space_check = false to skip this check)"
+            )
 
 
 def write_checksum(directory):
@@ -855,18 +1069,42 @@ def delete_old_backups(delete_complete_backups):
         Complete backups are deleted by age only after a successful run: if backups start to fail
         every night, the last good backups must not be rotated away.
     """
+    for path in find_old_backups(delete_complete_backups):
+        logger.info(f"removing old backup {path}")
+        shutil.rmtree(path)
+
+
+def find_old_backups(include_complete_backups):
+    """ Change nothing. Returns the list of backup directories which are older than backup_save_days. """
     now = utc_now()
+    old_backups = []
     for path in sorted(cfg.backup_root.iterdir()):
         match = BACKUP_DIRECTORY_REGEX.fullmatch(path.name)
         if not path.is_dir() or not match or match.group(2) == ".partial":
             logger.warning(f"unexpected path {path}")
             continue
-        if match.group(2) is None and not delete_complete_backups:
+        if match.group(2) is None and not include_complete_backups:
             continue
         created = datetime.datetime.strptime(match.group(1), TIMESTAMP_FORMAT).replace(tzinfo=datetime.timezone.utc)
         if now - created > datetime.timedelta(days=cfg.backup_save_days):
-            logger.info(f"removing old backup {path}")
-            shutil.rmtree(path)
+            old_backups.append(path)
+    return old_backups
+
+
+def write_success_file(backup_name):
+    """
+        The file is rewritten after each complete backup, so its modification time is the time of the last
+        complete backup. A monitoring system must raise an alarm when this file becomes too old:
+        this is the only way to notice that backups are not started at all.
+    """
+    if not cfg.success_file:
+        return
+    target = Path(cfg.success_file)
+    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(f"{utc_now().strftime('%Y-%m-%dT%H:%M:%SZ')} {backup_name}\n")
+    os.chmod(temporary, 0o644)
+    temporary.rename(target)
 
 
 def write_statistics(results, sizes, total_timer):
@@ -895,8 +1133,9 @@ def clickhouse_backup_main():
     detect_server()
     prepare_temporary_root()
     remove_leftovers_of_interrupted_runs()
+    plan = discover_databases()
+    check_free_space(plan)  # before the server configuration is touched
     ensure_server_configuration()
-    databases, excluded_tables, data_excluded_tables = discover_databases()
 
     backup_timestamp = utc_now().strftime(TIMESTAMP_FORMAT)
     final_directory = cfg.backup_root / f"{backup_timestamp}{BACKUP_DIRECTORY_SUFFIX}"
@@ -913,12 +1152,12 @@ def clickhouse_backup_main():
             ("--globals-only", backup_globals, directories),
             ("--config-only", backup_config, directories),
         ]
-        if databases:
-            tasks.append(("--schema-only", backup_schema, directories, excluded_tables))
-        for database in databases:
+        if plan.databases:
+            tasks.append(("--schema-only", backup_schema, directories, plan.excluded_tables))
+        for database in plan.databases:
             tasks.append((
                 database, backup_database, directories, database,
-                excluded_tables.get(database, []), data_excluded_tables.get(database, []),
+                plan.excluded_tables.get(database, []), plan.data_excluded_tables.get(database, []),
             ))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=cfg.jobs, thread_name_prefix="backup-") as executor:
@@ -963,18 +1202,121 @@ def clickhouse_backup_main():
 
     # "failed" is the list of failed tasks, the backup is complete if this list is empty
     backup_is_complete = (len(failed) == 0)
+    if backup_is_complete:
+        write_success_file(final_directory.name)
     delete_old_backups(delete_complete_backups=backup_is_complete)
     write_statistics(results, sizes, total_timer)
     lock.close()  # closing the lock file releases the lock
     return backup_is_complete
 
 
+def clickhouse_backup_check():
+    """
+        The --check mode: change nothing, start no backup, print what a real run would do.
+        Returns True if nothing prevents the backup.
+    """
+    problems = []
+
+    def problem(text):
+        problems.append(text)
+        return f"PROBLEM: {text}"
+
+    print(f"{PROGRAM} {__version__}: check mode, nothing is changed\n")
+    detect_server()
+    version = clickhouse_query("SELECT version() AS version")[0]["version"]
+    print("server")
+    print(f"    version                {version}")
+    print(f"    pid                    {server.pid}")
+    if server.root:
+        print(f"    mount namespace        private, files of the server are accessed through {server.root}")
+    else:
+        print(f"    mount namespace        shared with {PROGRAM}")
+
+    print("\ndirectories")
+    if cfg.backup_root.is_dir():
+        status = cfg.backup_root.stat()
+        if status.st_uid == cfg.uid and stat.S_IMODE(status.st_mode) == cfg.mode:
+            print(f"    backup_root            {cfg.backup_root} (exists)")
+        else:
+            print(f"    backup_root            {cfg.backup_root} (exists, owner and mode will be changed"
+                  f" to {cfg.user}:{cfg.group} 0{cfg.mode:o})")
+    else:
+        print(f"    backup_root            {cfg.backup_root} (will be created)")
+    exists, temporary_problem = inspect_temporary_root()
+    if temporary_problem is not None:
+        print(f"    temporary directory    {problem(temporary_problem)}")
+    elif exists:
+        print(f"    temporary directory    {host_path(temporary_root())} (exists)")
+    else:
+        print(f"    temporary directory    {host_path(temporary_root())} (will be created)")
+    if cfg.success_file:
+        print(f"    success file           {cfg.success_file}")
+
+    print("\nserver configuration")
+    configuration_plan = plan_server_configuration()
+    if configuration_plan.action == "none":
+        print("    no changes required")
+    else:
+        verb = "removed" if configuration_plan.action == "remove" else "written"
+        print(f"    {cfg.server_config_file} will be {verb}: {describe_server_configuration_change(configuration_plan)}")
+        print("    the server applies this change without a restart")
+
+    plan = discover_databases()
+    print("\ndatabases to backup")
+    width = max((len(database) for database in plan.databases), default=0)
+    for database in plan.databases:
+        print(f"    {database:{width}}  {plan.table_counts[database]:5d} tables  "
+              f"{format_size(plan.sizes[database]):>10}  {describe_compression(database)}")
+        if plan.excluded_tables.get(database):
+            print(f"    {'':{width}}  excluded tables: " + ", ".join(plan.excluded_tables[database]))
+        if plan.data_excluded_tables.get(database):
+            print(f"    {'':{width}}  saved without data: " + ", ".join(plan.data_excluded_tables[database]))
+    if not plan.databases:
+        print("    none")
+    print(f"    {'total':{width}}  {'':12}  {format_size(sum(plan.sizes.values())):>10}")
+    if plan.excluded_databases:
+        print("\nexcluded databases\n    " + ", ".join(plan.excluded_databases))
+
+    print("\nfree space" + ("" if cfg.free_space_check else " (free_space_check = false, a real run does not check it)"))
+    for directory, required, available in free_space_report(plan):
+        verdict = "OK" if available >= required else "NOT ENOUGH"
+        print(f"    {directory}: {format_size(required)} required, {format_size(available)} available, {verdict}")
+        if available < required and cfg.free_space_check:
+            problem(f"not enough free space in {directory}")
+
+    print("\nlimits")
+    print(f"    jobs={cfg.jobs} compression_threads={cfg.compression_threads} compression_nice={cfg.compression_nice}"
+          f" max_backup_bandwidth={cfg.max_backup_bandwidth} backup_timeout_hours={cfg.backup_timeout_hours}")
+
+    if cfg.backup_root.is_dir():
+        old_backups = find_old_backups(include_complete_backups=True)
+        print(f"\nrotation (backup_save_days = {cfg.backup_save_days})")
+        if old_backups:
+            print("    directories which will be removed after a complete backup:")
+            for path in old_backups:
+                print(f"        {path}")
+        else:
+            print("    nothing to remove")
+
+    print()
+    if problems:
+        print(f"result: {len(problems)} problem(s), the backup will fail")
+        for text in problems:
+            print(f"    {text}")
+    else:
+        print("result: OK, nothing prevents the backup")
+    return len(problems) == 0
+
+
 def main():
     arguments = parse_arguments()
-    configure_logging()
+    configure_logging(use_journal=not arguments.check)
     try:
         init(arguments)
-        succeeded = clickhouse_backup_main()
+        if arguments.check:
+            succeeded = clickhouse_backup_check()
+        else:
+            succeeded = clickhouse_backup_main()
     except Exception as exc:
         logger.error(f"{PROGRAM}: {exc.__class__.__name__}: {exc}")
         sys.exit(1)
