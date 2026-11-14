@@ -46,6 +46,21 @@
 #   but about 6-7 GiB at level 19 (extrapolated). If jobs > 1, multiply by the number of jobs.
 #compression_threads = 4
 
+# Priority of the zstd and tar processes started by clickhouse-backup: the "niceness" from -20 to 19,
+# as in nice(1). The higher the value, the more willingly these processes give CPU time to the
+# ClickHouse server. 0 means "do not change the priority".
+# It has an effect only when the CPU cores are busy, an idle server compresses at full speed.
+#compression_nice = 10
+
+# Limit of the read speed of one BACKUP statement, in bytes per second. 0 means unlimited.
+# This is the query-level setting 'max_backup_bandwidth' of ClickHouse: clickhouse-backup passes it
+# with each BACKUP statement, the server configuration is not changed and no restart is required.
+# It limits the disk load created by the server while it writes the tar archive, and makes
+# the backup proportionally longer: 100000000 (100 MB/s) means about 3 hours per 1 TB.
+# The number of threads of the server (the server setting 'backup_threads') can not be set here:
+# ClickHouse applies it only after a restart, see README.md.
+#max_backup_bandwidth = 0
+
 # Number of databases processed in parallel: an integer number or "auto" (half of CPU cores).
 # One BACKUP statement is already executed by many threads of the server.
 #jobs = 1
@@ -100,3 +115,4 @@
 #clickhouse_client = "/usr/bin/clickhouse-client"
 #zstd = "/usr/bin/zstd"
 #tar = "/usr/bin/tar"
+#nice = "/usr/bin/nice"

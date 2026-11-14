@@ -2,7 +2,7 @@
 
 __license__ = "GNU General Public License, version 3.0 or later"
 __contact__ = "https://github.com/makhomed/clickhouse-backup"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 try:
     import tomllib  # https://docs.python.org/3/library/tomllib.html
@@ -60,6 +60,7 @@ configuration_defaults = dict(
     clickhouse_client_config = "",
     zstd = "/usr/bin/zstd",
     tar = "/usr/bin/tar",
+    nice = "/usr/bin/nice",
     user = "clickhouse",
     group = "clickhouse",
     mode = 0o700,
@@ -67,6 +68,8 @@ configuration_defaults = dict(
     compression_level = 3,  # the default compression level of zstd itself
     compression_long = False,
     compression_threads = 4,
+    compression_nice = 10,
+    max_backup_bandwidth = 0,
     warning_threshold_hours = 4,
     exclude_databases = [],
     exclude_tables = {},
@@ -195,11 +198,20 @@ def read_configuration(arguments):
     # the command line overrides the configuration file, the sections [databases.<name>] too
     values["command_line_compression_level"] = arguments.compression_level
 
-    for key in ("backup_root", "temporary_directory", "clickhouse_client", "clickhouse_client_config", "zstd", "tar",
+    for key in ("backup_root", "temporary_directory", "clickhouse_client", "clickhouse_client_config", "zstd", "tar", "nice",
                 "user", "group", "server_config_file"):
         require_type(key, values[key], str)
-    for key in ("backup_save_days", "mode", "server_config_reload_timeout_seconds"):
+    for key in ("backup_save_days", "mode", "server_config_reload_timeout_seconds",
+                "compression_nice", "max_backup_bandwidth"):
         require_type(key, values[key], int)
+    if not (-20 <= values["compression_nice"] <= 19):
+        raise ValueError(
+            f"configuration key 'compression_nice': expected -20 <= value <= 19, got {values['compression_nice']}"
+        )
+    if values["max_backup_bandwidth"] < 0:
+        raise ValueError(
+            f"configuration key 'max_backup_bandwidth': expected value >= 0, got {values['max_backup_bandwidth']}"
+        )
     for key in configuration_overridable:
         validate_overridable(key, key, values[key])
     require_type("databases", values["databases"], dict)
@@ -245,7 +257,7 @@ def read_configuration(arguments):
         config_directories.append(directory)
     values["config_directories"] = config_directories
 
-    for key in ("clickhouse_client", "zstd", "tar"):
+    for key in ("clickhouse_client", "zstd", "tar", "nice"):
         if not Path(values[key]).is_file():
             raise ValueError(f"required binary file {values[key]} not found")
     if values["clickhouse_client_config"] and not Path(values["clickhouse_client_config"]).is_file():
@@ -396,11 +408,16 @@ def sql_string(value):
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def clickhouse_query(sql, query_id=None, interruptible=True):
-    """ Execute one statement and return the list of result rows, each row is a dict. """
+def clickhouse_query(sql, query_id=None, interruptible=True, settings=None):
+    """
+        Execute one statement and return the list of result rows, each row is a dict.
+        settings is a dict of query-level settings of ClickHouse, they are applied to this statement only.
+    """
     command = [cfg.clickhouse_client]
     if cfg.clickhouse_client_config:
         command += ["--config-file", cfg.clickhouse_client_config]
+    for name, value in (settings or dict()).items():
+        command.append(f"--{name}={value}")
     command += ["--format", "JSONEachRow", "--query_id", query_id or str(uuid.uuid4()), "--query", sql]
     stdout = run_command(command, capture_stdout=True, interruptible=interruptible)
     return [json.loads(line) for line in stdout.splitlines() if line.strip()]
@@ -423,12 +440,16 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
         so the client fails with a receive timeout on any long backup.
     """
     backup_id = str(uuid.uuid4())
-    settings = f"id = {sql_string(backup_id)}"
+    backup_settings = f"id = {sql_string(backup_id)}"
     if structure_only:
-        settings += ", structure_only = true"
-    statement = f"BACKUP {elements_sql} TO File({sql_string(str(tar_path))}) SETTINGS {settings} ASYNC"
+        backup_settings += ", structure_only = true"
+    statement = f"BACKUP {elements_sql} TO File({sql_string(str(tar_path))}) SETTINGS {backup_settings} ASYNC"
+    settings = dict()
+    if cfg.max_backup_bandwidth > 0:
+        # a query-level setting: it limits this backup only and needs no changes of the server configuration
+        settings["max_backup_bandwidth"] = cfg.max_backup_bandwidth
     try:
-        clickhouse_query(statement, query_id=backup_id)
+        clickhouse_query(statement, query_id=backup_id, settings=settings)
         delay = 0.1
         while True:
             rows = clickhouse_query(
@@ -457,6 +478,13 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
         raise RuntimeError(f"unexpected size of {tar_path}: {actual_size} bytes, server reported {expected_size} bytes")
 
 
+def with_nice(command):
+    """ zstd and tar must not take CPU time away from the ClickHouse server. """
+    if cfg.compression_nice == 0:
+        return command
+    return [cfg.nice, "-n", str(cfg.compression_nice)] + command
+
+
 def compress_and_verify(tar_path, backup_directory, database=None, must_contain=None):
     """
         Compress <temporary directory>/<name>.tar into <backup directory>/<name>.tar.zst,
@@ -471,16 +499,16 @@ def compress_and_verify(tar_path, backup_directory, database=None, must_contain=
         command.append("--long")
     # --rm removes the source file only after successful compression
     command += ["--rm", "-o", zst_path, "--", tar_path]
-    run_command(command)
+    run_command(with_nice(command))
     os.chown(zst_path, cfg.uid, cfg.gid)
     os.chmod(zst_path, 0o640)
     # 1) the zstd frames and their content checksums are intact
-    run_command([cfg.zstd, "--test", "--quiet", "--", zst_path])
+    run_command(with_nice([cfg.zstd, "--test", "--quiet", "--", zst_path]))
     # 2) the tar structure is readable up to the end, and the mandatory member is present
     command = [cfg.tar, f"--use-compress-program={cfg.zstd}", "--list", "--file", zst_path]
     if must_contain is not None:
         command.append(must_contain)
-    run_command(command)
+    run_command(with_nice(command))
     return zst_path
 
 
@@ -853,7 +881,10 @@ def write_statistics(results, sizes, total_timer):
         else:
             logger.info(f"-- {timer.hms()} {label:{width}} FAILED")
     line = "=" * width
-    logger.info(f"== {total_timer.hms()} {line} {format_size(total_size)} compression_threads={cfg.compression_threads}")
+    logger.info(
+        f"== {total_timer.hms()} {line} {format_size(total_size)} compression_threads={cfg.compression_threads}"
+        f" compression_nice={cfg.compression_nice} max_backup_bandwidth={cfg.max_backup_bandwidth}"
+    )
 
 
 def clickhouse_backup_main():
@@ -913,7 +944,7 @@ def clickhouse_backup_main():
         write_checksum(backup_directory)
         # the directory is renamed below, so the sizes are collected while the paths are still valid
         sizes = dict((label, path.stat().st_size) for label, timer, path, error in results if error is None)
-        if failed:
+        if len(failed) > 0:
             if any(error is None for label, timer, path, error in results):
                 backup_directory.rename(failed_directory)
                 logger.error(f"backup is incomplete, successfully created archives are kept in {failed_directory}")
@@ -930,10 +961,12 @@ def clickhouse_backup_main():
     finally:
         shutil.rmtree(host_path(temporary_run_directory), ignore_errors=True)
 
-    delete_old_backups(delete_complete_backups=not failed)
+    # "failed" is the list of failed tasks, the backup is complete if this list is empty
+    backup_is_complete = (len(failed) == 0)
+    delete_old_backups(delete_complete_backups=backup_is_complete)
     write_statistics(results, sizes, total_timer)
-    del lock
-    return not failed
+    lock.close()  # closing the lock file releases the lock
+    return backup_is_complete
 
 
 def main():

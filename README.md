@@ -1,5 +1,5 @@
 
-# clickhouse-backup (version 1.2.0)
+# clickhouse-backup (version 1.3.0)
 
 This tool, clickhouse-backup, saves backups of all databases located on the current ClickHouse server
 to the `/srv/clickhouse-backup/YYYY-MM-DD-HHMMSS-clickhouse-backup` directory:
@@ -121,6 +121,31 @@ writes `/etc/clickhouse-server/config.d/clickhouse-backup.xml` which adds them, 
 This normally happens once, on the first run. ClickHouse applies this change without a restart.
 clickhouse-backup never restarts the server: if the change is not applied within 30 seconds,
 it exits with an error and asks to execute `SYSTEM RELOAD CONFIG` or to restart the server.
+
+### Limiting the load
+
+A backup of one database has two phases, and they are limited in different ways.
+
+| phase | who works | what is loaded | how to limit |
+|-------|-----------|----------------|--------------|
+| `BACKUP ... TO File('<name>.tar')` | the ClickHouse server | disk reads and writes | `max_backup_bandwidth` |
+| `<name>.tar` to `<name>.tar.zst`, verification | `zstd` and `tar` started by clickhouse-backup | CPU, disk reads and writes | `compression_threads`, `compression_nice` |
+
+- `max_backup_bandwidth` is the read speed limit of one `BACKUP` statement in bytes per second, `0` means unlimited.
+  It is a query-level setting of ClickHouse, clickhouse-backup passes it with each `BACKUP` statement:
+  the server configuration is not changed, no restart is required, other queries are not affected.
+- `compression_nice` is the niceness of the `zstd` and `tar` processes, `10` by default.
+- The number of threads which the server uses for backups is the server setting `backup_threads`, `16` by default.
+  ClickHouse applies it only after a restart (`changeable_without_restart = No` in `system.server_settings`),
+  so clickhouse-backup does not manage it. To change it, create a file in `/etc/clickhouse-server/config.d/`
+  and restart the server:
+  ```
+  <clickhouse>
+      <backup_threads>4</backup_threads>
+  </clickhouse>
+  ```
+- For hard limits of CPU and memory of the whole clickhouse-backup process tree, start it from a systemd timer
+  with `CPUQuota=`, `MemoryMax=` and `Nice=` in the service unit instead of cron.
 
 ## How it works
 
