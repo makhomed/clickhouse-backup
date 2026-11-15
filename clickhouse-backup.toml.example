@@ -1,5 +1,8 @@
-# Example configuration of clickhouse-backup.
+
 #
+# Example configuration of clickhouse-backup
+#
+
 # Copy this file to /opt/clickhouse-backup/clickhouse-backup.toml and uncomment what you need.
 # Every key is optional, the values below are the built-in defaults.
 # Unknown keys are rejected.
@@ -152,3 +155,4 @@
 #zstd = "/usr/bin/zstd"
 #tar = "/usr/bin/tar"
 #nice = "/usr/bin/nice"
+
