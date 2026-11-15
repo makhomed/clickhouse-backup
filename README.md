@@ -1,5 +1,5 @@
 
-# clickhouse-backup (version 1.6.0)
+# clickhouse-backup (version 1.7.0)
 
 This tool, clickhouse-backup, saves backups of all databases located on the current ClickHouse server
 to the `/srv/clickhouse-backup/YYYY-MM-DD-HHMMSS-clickhouse-backup` directory:
@@ -43,6 +43,7 @@ Tested with ClickHouse 26.10 on Rocky Linux 9 (Python 3.9) and Rocky Linux 10 (P
     - [Server configuration](#server-configuration)
     - [Limiting the load](#limiting-the-load)
 - [How it works](#how-it-works)
+    - [Durability](#durability)
     - [Temporary files](#temporary-files)
     - [Free space](#free-space)
     - [Failures](#failures)
@@ -393,11 +394,35 @@ For each database:
 2. The size of `<name>.tar` is compared with the size reported by the server.
 3. `<name>.tar` is compressed by `zstd` to `<name>.tar.zst` in the backup directory, then `<name>.tar` is removed.
    ClickHouse can write `.tar.zst` itself, but it does not allow to choose the compression level for tar archives.
-4. The archive is verified: `zstd --test`, then `tar --list` must find the backup manifest `.backup` in it.
+4. The archive is flushed to the disk with `fsync` and dropped from the page cache.
+5. The archive is verified: `zstd --test`, then `tar --list` must find the backup manifest `.backup` in it.
+   Because of the previous step the archive is read from the disk, and not from the memory of the kernel.
 
 The archives are written to the directory `<timestamp>-clickhouse-backup.partial`.
 It is renamed to `<timestamp>-clickhouse-backup` only when all archives are created and verified,
 so a directory without a suffix is always a complete backup.
+
+### Durability
+
+A file which was written but not flushed may stay only in the memory of the kernel for tens of seconds.
+After a power failure such a file is truncated or empty. `zstd` does not flush its output, so clickhouse-backup
+does it itself, in this order:
+
+1. `fsync` of every archive, right after it is compressed;
+2. `fsync` of the `CHECKSUM` file;
+3. `fsync` of the backup directory: the names of the files in it become durable;
+4. the directory is renamed from `.partial` to its final name;
+5. `fsync` of `backup_root`: the new name of the directory becomes durable;
+6. only then the success file is written (and flushed too), and old backups are removed.
+
+So a directory with the name of a complete backup, a fresh success file and the removal of an old backup
+always mean that the new backup is really on the disk.
+
+Dropping an archive from the page cache before the verification is an advice to the kernel
+(`posix_fadvise` with `POSIX_FADV_DONTNEED`). Local file systems such as XFS and ext4 follow it.
+A file system with its own cache may ignore it, ZFS for example: the verification then reads the archive from
+that cache, which is not an error. `fsync` of a directory is not supported by some network and FUSE file
+systems: this is ignored, and the durability of the names then depends on that file system.
 
 ### Temporary files
 
@@ -675,6 +700,12 @@ Test the restore procedure regularly: a backup which was never restored is only 
 ## Troubleshooting
 
 All messages are printed to stderr and written to the journal: `journalctl -t clickhouse-backup --since today`.
+
+Errors which clickhouse-backup foresees are reported as `BackupError` or `ConfigurationError` with a message which
+says what is wrong. Any other error (`KeyError`, `JSONDecodeError`, `OSError` and so on) is unexpected: it is a bug
+of clickhouse-backup or a change of the behaviour of ClickHouse. For such an error the journal also contains
+the traceback, after the line `traceback of the unexpected error:`. It is not printed to stderr,
+except in the `--check` mode.
 
 | message or symptom | cause | what to do |
 |--------------------|-------|------------|

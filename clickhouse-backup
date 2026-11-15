@@ -5,10 +5,21 @@
 
 __contact__ = "https://github.com/makhomed/clickhouse-backup"
 __license__ = "GNU General Public License v3.0 or later"
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 
 """
+
+Changes with clickhouse-backup 1.7.0                       15 Nov 2026
+
+    *) Archives, the CHECKSUM file and the directories are flushed to disk
+       with fsync before a backup is declared complete
+
+    *) An archive is dropped from the page cache before the verification,
+       so the verification reads it from the disk
+
+    *) The traceback of an unexpected error is written to the journal
+
 
 Changes with clickhouse-backup 1.6.0                       15 Nov 2026
 
@@ -100,6 +111,7 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import datetime
+import errno
 import fcntl
 import grp
 import hashlib
@@ -116,6 +128,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import types
 import urllib.parse
 import uuid
@@ -208,13 +221,36 @@ child_environment = None
 
 
 class BackupInterrupted(Exception):
-    pass
+    """ The script was asked to terminate by a signal. """
+
+
+class BackupError(RuntimeError):
+    """ A failure which is foreseen by this script: the message says everything, no traceback is needed. """
+
+
+class ConfigurationError(ValueError):
+    """ A mistake in the configuration file or in the way the script is started. """
+
+
+EXPECTED_ERRORS = (BackupError, ConfigurationError, BackupInterrupted)
+
+
+def log_unexpected_error(error):
+    """
+        An error which is not foreseen by this script is a bug of the script, or a change of the behaviour
+        of ClickHouse: one line of the message is not enough to find it. The traceback is written to
+        the journal only (the INFO level), cron would send it by e-mail otherwise.
+    """
+    if isinstance(error, EXPECTED_ERRORS):
+        return
+    text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    logger.info(f"traceback of the unexpected error:\n{text}")
 
 
 def check_task_deadline():
     deadline = getattr(task_state, "deadline", None)
     if deadline is not None and time.monotonic() > deadline:
-        raise RuntimeError(f"backup is not finished within backup_timeout_hours = {cfg.backup_timeout_hours} hours")
+        raise BackupError(f"backup is not finished within backup_timeout_hours = {cfg.backup_timeout_hours} hours")
 
 
 def parse_arguments():
@@ -245,7 +281,7 @@ def require_type(key, value, expected_type):
     expected_types = expected_type if isinstance(expected_type, tuple) else (expected_type,)
     expected = " or ".join(one_type.__name__ for one_type in expected_types)
     if (isinstance(value, bool) and bool not in expected_types) or not isinstance(value, expected_types):
-        raise ValueError(f"configuration key {key!r}: expected {expected}, got {type(value).__name__}")
+        raise ConfigurationError(f"configuration key {key!r}: expected {expected}, got {type(value).__name__}")
 
 
 def auto_or_integer(key, value, minimum):
@@ -253,9 +289,9 @@ def auto_or_integer(key, value, minimum):
     if value == "auto":
         return max(cpu_count // 2, 1)
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"configuration key {key!r}: expected integer number or 'auto' string, got {value!r}")
+        raise ConfigurationError(f"configuration key {key!r}: expected integer number or 'auto' string, got {value!r}")
     if value < minimum:
-        raise ValueError(f"configuration key {key!r}: expected value >= {minimum}, got {value}")
+        raise ConfigurationError(f"configuration key {key!r}: expected value >= {minimum}, got {value}")
     return value
 
 
@@ -264,7 +300,7 @@ def validate_overridable(name, key, value):
     if key == "compression_level":
         require_type(name, value, int)
         if not (1 <= value <= 19):
-            raise ValueError(
+            raise ConfigurationError(
                 f"configuration key {name!r}: zstd compression level must be"
                 f" ( 1 <= level ) and ( level <= 19 ), unexpected value {value}"
             )
@@ -273,22 +309,25 @@ def validate_overridable(name, key, value):
     elif key == "warning_threshold_hours":
         require_type(name, value, (int, float))
         if value <= 0:
-            raise ValueError(f"configuration key {name!r}: expected value > 0, got {value}")
+            raise ConfigurationError(f"configuration key {name!r}: expected value > 0, got {value}")
     else:
-        raise ValueError(f"configuration key {name!r}: this key can not be set for one database")
+        raise ConfigurationError(f"configuration key {name!r}: this key can not be set for one database")
 
 
 def read_configuration(arguments):
     filename = arguments.config
     if filename.is_file():
-        values = tomllib.loads(filename.read_text())
+        try:
+            values = tomllib.loads(filename.read_text())
+        except ValueError as exc:  # tomllib.TOMLDecodeError and UnicodeDecodeError are ValueError
+            raise ConfigurationError(f"configuration file {filename}: {exc}")
     elif filename == configuration_filename:
         values = dict()  # the default configuration file is optional
     else:
-        raise ValueError(f"configuration file {filename} not found")
+        raise ConfigurationError(f"configuration file {filename} not found")
     for key in values:
         if key not in configuration_defaults:
-            raise ValueError(f"unexpected configuration key {key!r} in {filename}")
+            raise ConfigurationError(f"unexpected configuration key {key!r} in {filename}")
     for key, default in configuration_defaults.items():
         values.setdefault(key, default)
     # the command line overrides the configuration file, the sections [databases.<name>] too
@@ -302,24 +341,24 @@ def read_configuration(arguments):
                 "compression_nice", "max_backup_bandwidth", "backup_status_retry_seconds"):
         require_type(key, values[key], int)
     if values["backup_status_retry_seconds"] < 0:
-        raise ValueError(
+        raise ConfigurationError(
             "configuration key 'backup_status_retry_seconds': expected value >= 0,"
             f" got {values['backup_status_retry_seconds']}"
         )
     if not (-20 <= values["compression_nice"] <= 19):
-        raise ValueError(
+        raise ConfigurationError(
             f"configuration key 'compression_nice': expected -20 <= value <= 19, got {values['compression_nice']}"
         )
     require_type("free_space_check", values["free_space_check"], bool)
     require_type("backup_timeout_hours", values["backup_timeout_hours"], (int, float))
     if values["backup_timeout_hours"] <= 0:
-        raise ValueError(
+        raise ConfigurationError(
             f"configuration key 'backup_timeout_hours': expected value > 0, got {values['backup_timeout_hours']}"
         )
     if values["success_file"] and not Path(values["success_file"]).is_absolute():
-        raise ValueError(f"configuration key 'success_file': expected absolute path, got {values['success_file']}")
+        raise ConfigurationError(f"configuration key 'success_file': expected absolute path, got {values['success_file']}")
     if values["max_backup_bandwidth"] < 0:
-        raise ValueError(
+        raise ConfigurationError(
             f"configuration key 'max_backup_bandwidth': expected value >= 0, got {values['max_backup_bandwidth']}"
         )
     for key in configuration_overridable:
@@ -335,19 +374,19 @@ def read_configuration(arguments):
 
     values["backup_root"] = Path(values["backup_root"])
     if not values["backup_root"].is_absolute() or values["backup_root"] == Path("/"):
-        raise ValueError(f"configuration key 'backup_root': expected absolute path, got {values['backup_root']}")
+        raise ConfigurationError(f"configuration key 'backup_root': expected absolute path, got {values['backup_root']}")
     values["temporary_directory"] = Path(values["temporary_directory"])
     if not values["temporary_directory"].is_absolute():
-        raise ValueError(
+        raise ConfigurationError(
             f"configuration key 'temporary_directory': expected absolute path, got {values['temporary_directory']}"
         )
     values["server_config_file"] = Path(values["server_config_file"])
     if not values["server_config_file"].is_absolute():
-        raise ValueError("configuration key 'server_config_file': expected absolute path")
+        raise ConfigurationError("configuration key 'server_config_file': expected absolute path")
     if values["backup_save_days"] < 1:
-        raise ValueError(f"configuration key 'backup_save_days': expected value >= 1, got {values['backup_save_days']}")
+        raise ConfigurationError(f"configuration key 'backup_save_days': expected value >= 1, got {values['backup_save_days']}")
     if not (0o000 <= values["mode"] <= 0o777):
-        raise ValueError(f"configuration key 'mode': expected 0o000 <= mode <= 0o777, got 0o{values['mode']:o}")
+        raise ConfigurationError(f"configuration key 'mode': expected 0o000 <= mode <= 0o777, got 0o{values['mode']:o}")
     values["jobs"] = auto_or_integer("jobs", values["jobs"], minimum=1)
     # 0 means "let zstd detect the number of CPU cores"
     values["compression_threads"] = auto_or_integer("compression_threads", values["compression_threads"], minimum=0)
@@ -363,18 +402,24 @@ def read_configuration(arguments):
         require_type("config_directories", directory, str)
         directory = Path(directory)
         if not directory.is_absolute():
-            raise ValueError(f"configuration key 'config_directories': expected absolute path, got {directory}")
+            raise ConfigurationError(f"configuration key 'config_directories': expected absolute path, got {directory}")
         config_directories.append(directory)
     values["config_directories"] = config_directories
 
     for key in ("clickhouse_client", "zstd", "tar", "nice"):
         if not Path(values[key]).is_file():
-            raise ValueError(f"required binary file {values[key]} not found")
+            raise ConfigurationError(f"required binary file {values[key]} not found")
     if values["clickhouse_client_config"] and not Path(values["clickhouse_client_config"]).is_file():
-        raise ValueError(f"clickhouse-client configuration file {values['clickhouse_client_config']} not found")
+        raise ConfigurationError(f"clickhouse-client configuration file {values['clickhouse_client_config']} not found")
 
-    values["uid"] = pwd.getpwnam(values["user"]).pw_uid
-    values["gid"] = grp.getgrnam(values["group"]).gr_gid
+    try:
+        values["uid"] = pwd.getpwnam(values["user"]).pw_uid
+    except KeyError:
+        raise ConfigurationError(f"configuration key 'user': user {values['user']!r} not found")
+    try:
+        values["gid"] = grp.getgrnam(values["group"]).gr_gid
+    except KeyError:
+        raise ConfigurationError(f"configuration key 'group': group {values['group']!r} not found")
 
     global cfg
     cfg = types.SimpleNamespace(**values)
@@ -427,7 +472,7 @@ def configure_logging(use_journal):
 
 def init(arguments):
     if os.getegid() != 0 or os.geteuid() != 0:
-        raise ValueError("root privileges required")
+        raise ConfigurationError("root privileges required")
     register_exit_signal_handlers()
     read_configuration(arguments)
     global child_environment
@@ -528,12 +573,12 @@ def run_command(command, capture_stdout=False, interruptible=True):
                 raise BackupInterrupted(f"command {command[0]} was terminated")
             try:
                 check_task_deadline()
-            except RuntimeError:
+            except BackupError:
                 process.terminate()
                 process.communicate()
                 raise
     if process.returncode != 0:
-        raise RuntimeError(f"command {command[0]} failed with exit code {process.returncode}: {stderr.strip()}")
+        raise BackupError(f"command {command[0]} failed with exit code {process.returncode}: {stderr.strip()}")
     return stdout
 
 
@@ -595,7 +640,7 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
                     "SELECT status, error, compressed_size FROM system.backups"
                     f" WHERE id = {sql_string(backup_id)}"
                 )
-            except RuntimeError as exc:
+            except BackupError as exc:
                 # The backup itself is executed by the server and does not depend on this request.
                 # A busy server may refuse one request ("Too many simultaneous queries"), a healthy
                 # backup must not be cancelled because of that: the request is repeated.
@@ -603,7 +648,7 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
                     failing_since = time.monotonic()
                     logger.info(f"status request of backup {backup_id} failed, it will be repeated: {exc}")
                 if time.monotonic() - failing_since > cfg.backup_status_retry_seconds:
-                    raise RuntimeError(
+                    raise BackupError(
                         f"status of the backup is unknown for more than {cfg.backup_status_retry_seconds} seconds"
                         f" (backup_status_retry_seconds), the last error: {exc}"
                     )
@@ -616,13 +661,13 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
                 logger.info(f"status request of backup {backup_id} works again")
                 failing_since = None
             if len(rows) != 1:
-                raise RuntimeError(f"backup {backup_id} not found in system.backups, was the server restarted?")
+                raise BackupError(f"backup {backup_id} not found in system.backups, was the server restarted?")
             status = rows[0]["status"]
             if status == "BACKUP_CREATED":
                 break
             if status != "CREATING_BACKUP":
                 error = rows[0]["error"].splitlines()[0] if rows[0]["error"] else "no error message"
-                raise RuntimeError(f"backup status is {status}: {error}")
+                raise BackupError(f"backup status is {status}: {error}")
             if stop_event.wait(delay):
                 raise BackupInterrupted(f"backup {backup_id} was interrupted")
             check_task_deadline()  # the "except" below kills the query on the server
@@ -632,10 +677,45 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
         raise
     expected_size = int(rows[0]["compressed_size"])
     if not host_path(tar_path).is_file():
-        raise RuntimeError(f"server reported a successful backup, but {host_path(tar_path)} does not exist")
+        raise BackupError(f"server reported a successful backup, but {host_path(tar_path)} does not exist")
     actual_size = host_path(tar_path).stat().st_size
     if actual_size != expected_size:
-        raise RuntimeError(f"unexpected size of {tar_path}: {actual_size} bytes, server reported {expected_size} bytes")
+        raise BackupError(f"unexpected size of {tar_path}: {actual_size} bytes, server reported {expected_size} bytes")
+
+
+def flush_file_to_disk(path, drop_page_cache=False):
+    """
+        Without fsync the data of a new file may stay only in the memory of the kernel for tens of
+        seconds: after a power failure the file is truncated or empty, although it was "written".
+
+        drop_page_cache asks the kernel to forget the cached pages of the file. The following reads then
+        come from the disk, so the verification checks what is really stored, and not what was passed
+        to the kernel. It is only an advice: some file systems ignore it, this is not an error.
+    """
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+        if drop_page_cache:
+            try:
+                os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+    finally:
+        os.close(descriptor)
+
+
+def flush_directory_to_disk(path):
+    """ A new name, or a new name after a rename, is durable only after fsync of the directory which holds it. """
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            # some network and FUSE file systems do not support fsync of a directory
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP):
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def with_nice(command):
@@ -662,6 +742,9 @@ def compress_and_verify(tar_path, backup_directory, database=None, must_contain=
     run_command(with_nice(command))
     os.chown(zst_path, cfg.uid, cfg.gid)
     os.chmod(zst_path, 0o640)
+    # zstd does not call fsync; after this line the archive is on the disk and is not in the page cache,
+    # so the verification below reads it from the disk
+    flush_file_to_disk(zst_path, drop_page_cache=True)
     # 1) the zstd frames and their content checksums are intact
     run_command(with_nice([cfg.zstd, "--test", "--quiet", "--", zst_path]))
     # 2) the tar structure is readable up to the end, and the mandatory member is present
@@ -757,7 +840,7 @@ def acquire_lock():
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise RuntimeError(f"another instance of {PROGRAM} is already running")
+        raise BackupError(f"another instance of {PROGRAM} is already running")
     return lock_file  # the lock is held while this object is alive
 
 
@@ -779,22 +862,22 @@ def detect_server():
     """
     rows = clickhouse_query("SELECT path FROM system.disks WHERE name = 'default'")
     if len(rows) != 1:
-        raise RuntimeError("unable to detect the data path of the ClickHouse server")
+        raise BackupError("unable to detect the data path of the ClickHouse server")
     data_path = Path(rows[0]["path"])
     status_file = data_path / "status"  # written by the server at startup: "PID: <pid>"
     if not status_file.is_file():
-        raise RuntimeError(f"status file {status_file} of the ClickHouse server not found, is the server on this host?")
+        raise BackupError(f"status file {status_file} of the ClickHouse server not found, is the server on this host?")
     match = re.search(r"^PID: (\d+)$", status_file.read_text(), re.MULTILINE)
     if not match:
-        raise RuntimeError(f"unable to find the PID of the ClickHouse server in {status_file}")
+        raise BackupError(f"unable to find the PID of the ClickHouse server in {status_file}")
     pid = int(match.group(1))
     try:
         executable = os.readlink(f"/proc/{pid}/exe")
         server_namespace = os.readlink(f"/proc/{pid}/ns/mnt")
     except OSError as exc:
-        raise RuntimeError(f"process {pid} from {status_file} is not accessible: {exc}")
+        raise BackupError(f"process {pid} from {status_file} is not accessible: {exc}")
     if "clickhouse" not in Path(executable).name:
-        raise RuntimeError(f"process {pid} from {status_file} is {executable}, it is not a ClickHouse server")
+        raise BackupError(f"process {pid} from {status_file} is {executable}, it is not a ClickHouse server")
     if server_namespace == os.readlink("/proc/self/ns/mnt"):
         root = ""
     else:
@@ -821,7 +904,7 @@ def prepare_temporary_root():
     """
     exists, problem = inspect_temporary_root()
     if problem is not None:
-        raise RuntimeError(problem)
+        raise BackupError(problem)
     if not exists:
         root = host_path(temporary_root())
         try:
@@ -831,7 +914,7 @@ def prepare_temporary_root():
             pass
         exists, problem = inspect_temporary_root()  # somebody could create it between the two calls
         if problem is not None or not exists:
-            raise RuntimeError(problem or f"unable to create {root}")
+            raise BackupError(problem or f"unable to create {root}")
 
 
 def inspect_temporary_root():
@@ -902,7 +985,7 @@ def read_allowed_backup_paths():
     """
     preprocessed = server.data_path / "preprocessed_configs" / "config.xml"
     if not preprocessed.is_file():
-        raise RuntimeError(
+        raise BackupError(
             f"effective server configuration {preprocessed} not found, add {cfg.backup_root}/ and "
             f"{temporary_root()}/ to <backups><allowed_path> of the server configuration manually"
         )
@@ -953,7 +1036,7 @@ def plan_server_configuration():
     current = target.read_text() if target.is_file() else None
     own_file = current is not None and current.startswith(SERVER_CONFIG_HEADER)
     if current is not None and not own_file:
-        raise RuntimeError(
+        raise BackupError(
             f"server configuration file {target} exists, but it was not written by {PROGRAM}: "
             "rename it, or set another name in the 'server_config_file' key"
         )
@@ -1012,13 +1095,15 @@ def ensure_server_configuration():
         logger.warning(f"server configuration file {target} was removed: {describe_server_configuration_change(plan)}")
     else:
         if not target.parent.is_dir():
-            raise RuntimeError(f"server configuration directory {target.parent} not found")
+            raise BackupError(f"server configuration directory {target.parent} not found")
         owner = target.parent.stat()
         temporary = target.with_name(target.name + ".tmp")  # the server reads only *.xml, *.yaml and *.conf files
         temporary.write_text(plan.text)
         os.chown(temporary, owner.st_uid, owner.st_gid)
         os.chmod(temporary, 0o644)
+        flush_file_to_disk(temporary)
         temporary.rename(target)
+        flush_directory_to_disk(target.parent)
         logger.warning(f"server configuration file {target} was written: {describe_server_configuration_change(plan)}")
 
     deadline = time.monotonic() + cfg.server_config_reload_timeout_seconds
@@ -1029,7 +1114,7 @@ def ensure_server_configuration():
         required_are_allowed = all(is_path_allowed(path, foreign + managed) for path in plan.required)
         if required_are_allowed and not any(value in managed for value in plan.remove):
             return
-    raise RuntimeError(
+    raise BackupError(
         f"server configuration file {target} was changed, but the server has not applied it within "
         f"{cfg.server_config_reload_timeout_seconds} seconds: execute SYSTEM RELOAD CONFIG "
         "or restart clickhouse-server, and then run the backup again"
@@ -1150,7 +1235,7 @@ def check_free_space(plan):
         return
     for directory, required, available in free_space_report(plan):
         if available < required:
-            raise RuntimeError(
+            raise BackupError(
                 f"not enough free space in {directory}: {format_size(required)} required, "
                 f"{format_size(available)} available (set free_space_check = false to skip this check)"
             )
@@ -1168,6 +1253,7 @@ def write_checksum(directory):
     checksum.write_text("".join(lines))
     os.chown(checksum, cfg.uid, cfg.gid)
     os.chmod(checksum, 0o640)
+    flush_file_to_disk(checksum)
 
 
 def delete_old_backups(delete_complete_backups):
@@ -1228,7 +1314,9 @@ def write_success_file(backup_name):
     temporary = target.with_name(target.name + ".tmp")
     temporary.write_text(f"{utc_now().strftime('%Y-%m-%dT%H:%M:%SZ')} {backup_name}\n")
     os.chmod(temporary, 0o644)
+    flush_file_to_disk(temporary)
     temporary.rename(target)
+    flush_directory_to_disk(target.parent)
 
 
 def write_statistics(results, sizes, total_timer):
@@ -1292,6 +1380,7 @@ def clickhouse_backup_main():
         failed = [(label, error) for label, timer, path, error in results if error is not None]
         for label, error in failed:
             logger.error(f"backup of {label} failed: {error.__class__.__name__}: {error}")
+            log_unexpected_error(error)
         for label, timer, path, error in results:
             if error is None and timer.hours() > setting("warning_threshold_hours", label):
                 logger.warning(f"backup of {label} creation time {timer.hms()} exceeds warning_threshold_hours limit")
@@ -1307,6 +1396,9 @@ def clickhouse_backup_main():
         write_checksum(backup_directory)
         # the directory is renamed below, so the sizes are collected while the paths are still valid
         sizes = dict((label, path.stat().st_size) for label, timer, path, error in results if error is None)
+        # every archive and the CHECKSUM file are already flushed, now the names of the files inside
+        # the directory, and then the new name of the directory itself, are made durable
+        flush_directory_to_disk(backup_directory)
         if len(failed) > 0:
             if any(error is None for label, timer, path, error in results):
                 backup_directory.rename(failed_directory)
@@ -1316,6 +1408,7 @@ def clickhouse_backup_main():
                 logger.error("backup failed, no archives were created")
         else:
             backup_directory.rename(final_directory)
+        flush_directory_to_disk(cfg.backup_root)
     except BaseException:
         # termination by a signal or an unexpected error: leave no garbage behind
         stop_event.set()
@@ -1443,6 +1536,9 @@ def main():
             succeeded = clickhouse_backup_main()
     except Exception as exc:
         logger.error(f"{PROGRAM}: {exc.__class__.__name__}: {exc}")
+        if arguments.check and not isinstance(exc, EXPECTED_ERRORS):
+            traceback.print_exc()  # the check mode is interactive and does not write to the journal
+        log_unexpected_error(exc)
         sys.exit(1)
     sys.exit(0 if succeeded else 1)
 
