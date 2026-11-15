@@ -1,5 +1,5 @@
 
-# clickhouse-backup (version 1.5.0)
+# clickhouse-backup (version 1.6.0)
 
 This tool, clickhouse-backup, saves backups of all databases located on the current ClickHouse server
 to the `/srv/clickhouse-backup/YYYY-MM-DD-HHMMSS-clickhouse-backup` directory:
@@ -21,7 +21,75 @@ Every backup directory is complete and independent of all other backup directori
     CHECKSUM                                   SHA256 of every archive
 ```
 
-Tested with ClickHouse 26.10 on Rocky Linux 10. The code is compatible with Python 3.9 (Rocky Linux 9).
+Tested with ClickHouse 26.10 on Rocky Linux 9 (Python 3.9) and Rocky Linux 10 (Python 3.12).
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Upgrade](#upgrade)
+    - [After an upgrade of ClickHouse](#after-an-upgrade-of-clickhouse)
+- [Usage](#usage)
+    - [Check before the first run](#check-before-the-first-run)
+    - [Connection to the server](#connection-to-the-server)
+- [Automation](#automation)
+    - [cron](#cron)
+    - [systemd timer](#systemd-timer)
+    - [Monitoring](#monitoring)
+- [Configuration](#configuration)
+    - [Reference of the configuration keys](#reference-of-the-configuration-keys)
+    - [Compression threads and memory](#compression-threads-and-memory)
+    - [Server configuration](#server-configuration)
+    - [Limiting the load](#limiting-the-load)
+- [How it works](#how-it-works)
+    - [Temporary files](#temporary-files)
+    - [Free space](#free-space)
+    - [Failures](#failures)
+- [What is saved, and what is not](#what-is-saved-and-what-is-not)
+    - [Secrets in the backup](#secrets-in-the-backup)
+    - [Consistency](#consistency)
+- [Restore](#restore)
+    - [0. Verify the archives](#0-verify-the-archives)
+    - [1. Restore a lost database](#1-restore-a-lost-database)
+    - [2. Restore a database under another name](#2-restore-a-database-under-another-name)
+    - [3. Restore one table](#3-restore-one-table)
+    - [4. Restore users, roles and functions](#4-restore-users-roles-and-functions)
+    - [5. Restore only the structure](#5-restore-only-the-structure)
+    - [6. Restore the server configuration](#6-restore-the-server-configuration)
+    - [7. Restore the whole server on a new host](#7-restore-the-whole-server-on-a-new-host)
+    - [8. If RESTORE is unable to read the archive](#8-if-restore-is-unable-to-read-the-archive)
+    - [Progress and errors of RESTORE](#progress-and-errors-of-restore)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+## Quick start
+
+```
+dnf install zstd tar python3-systemd
+python3 -c 'import tomllib' || python3 -m pip install tomli
+
+cd /opt ; git clone https://github.com/makhomed/clickhouse-backup.git
+
+/opt/clickhouse-backup/clickhouse-backup --check      # changes nothing, shows what will be done
+/opt/clickhouse-backup/clickhouse-backup              # the first backup
+echo $?                                               # 0 means a complete backup
+ls -l /srv/clickhouse-backup/*/
+
+echo '0 0 * * * root /opt/clickhouse-backup/clickhouse-backup' > /etc/cron.d/clickhouse-backup
+```
+
+Then:
+
+- restore one database under another name to be sure that the backup is usable:
+  [Restore, 2](#2-restore-a-database-under-another-name);
+- let the monitoring system watch the age of `/var/lib/clickhouse-backup/last-successful-backup`:
+  [Monitoring](#monitoring);
+- read [What is saved, and what is not](#what-is-saved-and-what-is-not).
+
+No configuration file is required. The first run creates `/srv/clickhouse-backup`,
+`/var/tmp/clickhouse-backup` and `/etc/clickhouse-server/config.d/clickhouse-backup.xml`,
+the server is not restarted.
 
 ## Requirements
 
@@ -211,6 +279,40 @@ it is the default level of zstd itself.
 Three settings can be set for one database: `compression_level`, `compression_long`
 and `warning_threshold_hours`.
 
+Unknown keys and values of a wrong type are errors: clickhouse-backup prints the name of the key and exits with code `1`.
+
+### Reference of the configuration keys
+
+| key | default | description |
+|-----|---------|-------------|
+| `backup_root` | `"/srv/clickhouse-backup"` | Root directory of the backups. Each run creates `<backup_root>/YYYY-MM-DD-HHMMSS-clickhouse-backup`, the time is in UTC. |
+| `backup_save_days` | `7` | Complete backups older than this number of days are removed after a successful run. See [Failures](#failures). |
+| `temporary_directory` | `"/var/tmp"` | Uncompressed archives are written to `<temporary_directory>/clickhouse-backup/<random name>`. See [Temporary files](#temporary-files). |
+| `free_space_check` | `true` | Compare the size of the databases with the free space before the backup is started. See [Free space](#free-space). |
+| `exclude_databases` | `[]` | Databases which are not saved. `system`, `INFORMATION_SCHEMA` and `information_schema` are never saved. |
+| `exclude_tables.<database>` | none | List of tables of this database which are not saved: neither data nor definition. |
+| `compression_level` | `3` | zstd compression level, from `1` to `19`. The option `--compression-level` overrides it. Can be set for one database. |
+| `compression_long` | `false` | Long distance matching mode of zstd (`zstd --long`). Can be set for one database. |
+| `compression_threads` | `4` | Threads of one `zstd` process: a number, `0` (all CPU cores) or `"auto"` (half of the CPU cores). See [Compression threads and memory](#compression-threads-and-memory). |
+| `compression_nice` | `10` | Niceness of the `zstd` and `tar` processes, from `-20` to `19`, `0` means "do not change". |
+| `max_backup_bandwidth` | `0` | Read speed limit of one `BACKUP` statement in bytes per second, `0` means unlimited. See [Limiting the load](#limiting-the-load). |
+| `jobs` | `1` | Databases processed in parallel: a number or `"auto"` (half of the CPU cores). One `BACKUP` statement is already executed by many threads of the server. |
+| `backup_timeout_hours` | `24` | The backup of one database is cancelled if it takes more than this number of hours. |
+| `backup_status_retry_seconds` | `300` | How long failed status requests are repeated before a running backup is cancelled. See [Failures](#failures). |
+| `warning_threshold_hours` | `4` | A warning is printed if the backup of one database takes more than this number of hours. Can be set for one database. |
+| `databases.<database>.<key>` | none | Value of `compression_level`, `compression_long` or `warning_threshold_hours` for one database. |
+| `success_file` | `"/var/lib/clickhouse-backup/last-successful-backup"` | File which is rewritten after each complete backup, an empty string disables it. See [Monitoring](#monitoring). |
+| `config_directories` | `["/etc/clickhouse-server", "/etc/clickhouse-client"]` | Directories saved to the `config-only` archive. |
+| `clickhouse_client_config` | `""` | Configuration file of `clickhouse-client` with the user name and the password. See [Connection to the server](#connection-to-the-server). |
+| `server_config_file` | `"/etc/clickhouse-server/config.d/clickhouse-backup.xml"` | Server configuration file managed by clickhouse-backup. See [Server configuration](#server-configuration). |
+| `server_config_reload_timeout_seconds` | `30` | How long to wait until the server applies a changed `server_config_file`. |
+| `user`, `group` | `"clickhouse"` | Owner of the backup directories and of the archives: the user of the clickhouse-server process, because the server writes the archives. |
+| `mode` | `0o700` | Mode of `backup_root` and of the backup directories. |
+| `clickhouse_client` | `"/usr/bin/clickhouse-client"` | Path of the program. |
+| `zstd` | `"/usr/bin/zstd"` | Path of the program. |
+| `tar` | `"/usr/bin/tar"` | Path of the program. |
+| `nice` | `"/usr/bin/nice"` | Path of the program. |
+
 ### Compression threads and memory
 
 `compression_threads` is the number of threads of one `zstd` process, the default is `4`.
@@ -382,10 +484,18 @@ Limitations of this check:
 - The backup of one database is cancelled and counted as failed if it takes more than `backup_timeout_hours`,
   `24` by default: the `BACKUP` query is killed on the server. Without this limit a hung backup
   would hold the lock forever.
+- While the server executes a `BACKUP` statement, clickhouse-backup asks it for the status every few seconds.
+  A busy server may refuse such a request (`Too many simultaneous queries`) or drop the connection.
+  The backup itself is not affected, so the request is repeated. The backup is cancelled only if the status
+  stays unknown for more than `backup_status_retry_seconds`, `300` by default, without a break.
 - If the backup of at least one database fails, the directory is renamed to `<timestamp>-clickhouse-backup.failed`.
   It contains only the verified archives of other databases. The exit code is `1`.
 - Complete backups older than `backup_save_days` are removed only after a successful run, so repeated
-  failures never rotate the last good backups away. Failed backups are removed by age after any run.
+  failures never rotate the last good backups away.
+- Only the newest `.failed` directory is kept, older ones are removed after any run: a failed backup is nearly
+  as large as a complete one. The newest one is removed when it becomes older than `backup_save_days`.
+- An old backup is renamed to `<timestamp>-clickhouse-backup.partial` before it is removed. If the removal
+  is interrupted, the next run finishes it: a half-removed directory never has the name of a backup.
 - On SIGTERM, SIGINT, SIGQUIT or SIGHUP the running `BACKUP` query is killed on the server,
   the temporary files and the `.partial` directory are removed.
 - If clickhouse-backup was killed with SIGKILL or the host was rebooted, the next run kills the unfinished
@@ -570,6 +680,7 @@ All messages are printed to stderr and written to the journal: `journalctl -t cl
 |--------------------|-------|------------|
 | `another instance of clickhouse-backup is already running` | The previous run is still working or hangs. | `pgrep -af clickhouse-backup`, and look at the running backups: `SELECT name, status, start_time FROM system.backups WHERE status = 'CREATING_BACKUP'`. Send SIGTERM to a hung run: it kills its `BACKUP` query and cleans up. Never remove the lock file by hand. |
 | `backup is not finished within backup_timeout_hours = N hours` | One database took longer than the limit, its `BACKUP` query was killed. | Raise `backup_timeout_hours`, or remove a too low `max_backup_bandwidth`. |
+| `status of the backup is unknown for more than N seconds (backup_status_retry_seconds)` | The server did not answer the status requests for too long, the last error follows. The `BACKUP` query was killed. | Find out why the server refuses queries (overload, `max_concurrent_queries`, restart). Raise `backup_status_retry_seconds` if such periods are normal for this server. |
 | `not enough free space in DIR: X required, Y available` | The estimate of the required space is higher than the free space. | Free some space or reduce `backup_save_days`. The estimate for `backup_root` assumes no compression: if you know that the backup fits, set `free_space_check = false`. See [Free space](#free-space). |
 | `DIR must be a directory owned by the user clickhouse with mode 0700, but something else was found there` | A file, a symbolic link or a directory of another user occupies the name of the temporary directory. | Look at it (`ls -ld DIR`), find out who has created it, remove it. |
 | `server configuration file FILE was changed, but the server has not applied it within N seconds` | The server has not reloaded its configuration. | `clickhouse-client --query "SYSTEM RELOAD CONFIG"`, then run the backup again. Look for errors of the configuration in `/var/log/clickhouse-server/clickhouse-server.err.log`. |
@@ -588,4 +699,6 @@ All messages are printed to stderr and written to the journal: `journalctl -t cl
 
 ## License
 
-GNU General Public License, version 3.0 or later, see the `LICENSE` file.
+GNU General Public License v3.0 or later, see the `LICENSE` file.
+
+The list of changes of every version is at the beginning of the `clickhouse-backup` script.

@@ -36,6 +36,12 @@
 # A hung backup would otherwise hold the lock forever, and all following runs would fail.
 #backup_timeout_hours = 24
 
+# While the server executes a BACKUP statement, clickhouse-backup asks it for the status of the backup
+# every few seconds. A busy server may refuse such a request ("Too many simultaneous queries") or drop
+# the connection. The backup itself is not affected, so the request is repeated, and the backup is
+# cancelled only if the status stays unknown for more than this number of seconds without a break.
+#backup_status_retry_seconds = 300
+
 # This file is rewritten after each complete backup: it contains the UTC time and the name of the
 # backup directory, its modification time is the time of the last complete backup.
 # Let the monitoring system raise an alarm when this file is older than, for example, 26 hours:
@@ -44,6 +50,8 @@
 #success_file = "/var/lib/clickhouse-backup/last-successful-backup"
 
 # Complete backups older than this number of days are removed after each successful run.
+# Failed backups (directories with the .failed suffix) are removed after any run:
+# only the newest one is kept, and it is removed when it becomes older than this number of days.
 #backup_save_days = 7
 
 # zstd compression level, from 1 to 19. 3 is the default level of zstd itself.

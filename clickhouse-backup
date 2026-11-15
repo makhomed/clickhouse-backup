@@ -1,8 +1,87 @@
 #!/usr/bin/python3 -u
 
-__license__ = "GNU General Public License, version 3.0 or later"
+""" Save backups of all ClickHouse databases, one archive per database
+"""
+
 __contact__ = "https://github.com/makhomed/clickhouse-backup"
-__version__ = "1.5.0"
+__license__ = "GNU General Public License v3.0 or later"
+__version__ = "1.6.0"
+
+
+"""
+
+Changes with clickhouse-backup 1.6.0                       15 Nov 2026
+
+    *) A failed status request does not cancel a running backup any more,
+       requests are repeated for backup_status_retry_seconds
+
+    *) Only the newest failed backup is kept
+
+    *) An old backup is renamed before it is removed, so an interrupted
+       rotation never leaves a damaged directory with the name of a backup
+
+    *) The list of changes is kept inside the script
+
+
+Changes with clickhouse-backup 1.5.0                       15 Nov 2026
+
+    *) The allowed_path elements written to the server configuration carry
+       their own attribute: paths of the administrator are never replaced
+
+    *) Paths which are not required any more are removed from the server
+       configuration file
+
+    *) A server configuration file written by somebody else is not overwritten
+
+
+Changes with clickhouse-backup 1.4.0                       14 Nov 2026
+
+    *) Free space is checked before the backup is started
+
+    *) New option --check: change nothing, show what a real run would do
+
+    *) New key backup_timeout_hours, a hung backup is cancelled
+
+    *) The time of the last complete backup is written to success_file
+
+    *) HOME is set for clickhouse-client if it is started by systemd
+
+    *) Messages are not duplicated in the journal if started by systemd
+
+
+Changes with clickhouse-backup 1.3.0                       14 Nov 2026
+
+    *) New key compression_nice, zstd and tar are started with nice
+
+    *) New key max_backup_bandwidth, the read speed limit of BACKUP
+
+
+Changes with clickhouse-backup 1.2.0                       14 Nov 2026
+
+    *) Works with PrivateTmp=yes of clickhouse-server.service: files of the
+       server are accessed through /proc/<pid>/root
+
+    *) Settings of one database in the section [databases.<name>]
+
+    *) compression_threads is 4 by default instead of "auto"
+
+
+Changes with clickhouse-backup 1.1.0                       14 Nov 2026
+
+    *) Uncompressed archives are written to temporary_directory, /var/tmp
+       by default, in a private subdirectory with an unpredictable name
+
+    *) Data of the Memory engine is not saved: ClickHouse 26.10 is unable
+       to restore it from a tar archive
+
+    *) License changed to GNU General Public License v3.0 or later
+
+
+Changes with clickhouse-backup 1.0.0                       14 Nov 2026
+
+    *) The first version
+
+"""
 
 try:
     import tomllib  # https://docs.python.org/3/library/tomllib.html
@@ -71,6 +150,7 @@ configuration_defaults = dict(
     compression_nice = 10,
     max_backup_bandwidth = 0,
     backup_timeout_hours = 24,
+    backup_status_retry_seconds = 300,
     free_space_check = True,
     success_file = "/var/lib/clickhouse-backup/last-successful-backup",
     warning_threshold_hours = 4,
@@ -219,8 +299,13 @@ def read_configuration(arguments):
                 "user", "group", "server_config_file"):
         require_type(key, values[key], str)
     for key in ("backup_save_days", "mode", "server_config_reload_timeout_seconds",
-                "compression_nice", "max_backup_bandwidth"):
+                "compression_nice", "max_backup_bandwidth", "backup_status_retry_seconds"):
         require_type(key, values[key], int)
+    if values["backup_status_retry_seconds"] < 0:
+        raise ValueError(
+            "configuration key 'backup_status_retry_seconds': expected value >= 0,"
+            f" got {values['backup_status_retry_seconds']}"
+        )
     if not (-20 <= values["compression_nice"] <= 19):
         raise ValueError(
             f"configuration key 'compression_nice': expected -20 <= value <= 19, got {values['compression_nice']}"
@@ -503,11 +588,33 @@ def clickhouse_backup(elements_sql, tar_path, structure_only=False):
     try:
         clickhouse_query(statement, query_id=backup_id, settings=settings)
         delay = 0.1
+        failing_since = None  # time.monotonic() of the first of the consecutive failed status requests
         while True:
-            rows = clickhouse_query(
-                "SELECT status, error, compressed_size FROM system.backups"
-                f" WHERE id = {sql_string(backup_id)}"
-            )
+            try:
+                rows = clickhouse_query(
+                    "SELECT status, error, compressed_size FROM system.backups"
+                    f" WHERE id = {sql_string(backup_id)}"
+                )
+            except RuntimeError as exc:
+                # The backup itself is executed by the server and does not depend on this request.
+                # A busy server may refuse one request ("Too many simultaneous queries"), a healthy
+                # backup must not be cancelled because of that: the request is repeated.
+                if failing_since is None:
+                    failing_since = time.monotonic()
+                    logger.info(f"status request of backup {backup_id} failed, it will be repeated: {exc}")
+                if time.monotonic() - failing_since > cfg.backup_status_retry_seconds:
+                    raise RuntimeError(
+                        f"status of the backup is unknown for more than {cfg.backup_status_retry_seconds} seconds"
+                        f" (backup_status_retry_seconds), the last error: {exc}"
+                    )
+                if stop_event.wait(delay):
+                    raise BackupInterrupted(f"backup {backup_id} was interrupted")
+                check_task_deadline()
+                delay = min(delay * 2, 5.0)
+                continue
+            if failing_since is not None:
+                logger.info(f"status request of backup {backup_id} works again")
+                failing_since = None
             if len(rows) != 1:
                 raise RuntimeError(f"backup {backup_id} not found in system.backups, was the server restarted?")
             status = rows[0]["status"]
@@ -1071,24 +1178,41 @@ def delete_old_backups(delete_complete_backups):
     """
     for path in find_old_backups(delete_complete_backups):
         logger.info(f"removing old backup {path}")
-        shutil.rmtree(path)
+        # The directory is renamed first. If the removal is interrupted, a half-removed directory has
+        # the .partial suffix and is removed by the next run, it never looks like a backup.
+        doomed = path.with_name(path.name.split(BACKUP_DIRECTORY_SUFFIX)[0] + BACKUP_DIRECTORY_SUFFIX + ".partial")
+        if doomed.exists():
+            shutil.rmtree(doomed)
+        path.rename(doomed)
+        shutil.rmtree(doomed)
 
 
 def find_old_backups(include_complete_backups):
-    """ Change nothing. Returns the list of backup directories which are older than backup_save_days. """
+    """
+        Change nothing. Returns the list of backup directories to remove:
+        - complete and failed backups which are older than backup_save_days;
+        - every failed backup except the newest one: a failed backup is nearly as large as a complete one,
+          and seven incomplete backups are not more useful than one.
+    """
     now = utc_now()
     old_backups = []
-    for path in sorted(cfg.backup_root.iterdir()):
+    failed_backups = []
+    for path in sorted(cfg.backup_root.iterdir()):  # the names start with the time, so the order is chronological
         match = BACKUP_DIRECTORY_REGEX.fullmatch(path.name)
         if not path.is_dir() or not match or match.group(2) == ".partial":
             logger.warning(f"unexpected path {path}")
             continue
-        if match.group(2) is None and not include_complete_backups:
+        if match.group(2) == ".failed":
+            failed_backups.append(path)
+        elif not include_complete_backups:
             continue
         created = datetime.datetime.strptime(match.group(1), TIMESTAMP_FORMAT).replace(tzinfo=datetime.timezone.utc)
         if now - created > datetime.timedelta(days=cfg.backup_save_days):
             old_backups.append(path)
-    return old_backups
+    for path in failed_backups[:-1]:
+        if path not in old_backups:
+            old_backups.append(path)
+    return sorted(old_backups)
 
 
 def write_success_file(backup_name):
